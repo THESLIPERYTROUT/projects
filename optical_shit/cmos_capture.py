@@ -1,6 +1,9 @@
 import ctypes
 import numpy as np
 from pyueye import ueye
+import os
+import time
+import cv2
 
 def check(ret, msg="uEye call failed"):
     # Some calls (e.g. is_FreezeVideo) return IS_CAPTURE_RUNNING (140) when the
@@ -29,6 +32,12 @@ def get_exposure_ms(h_cam) -> float:
     return float(exp.value)
 
 def main():
+    # prepare output folder next to this script
+    script_dir = os.path.dirname(__file__)
+    out_dir = os.path.join(script_dir, "output")
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"saving frames to {out_dir}")
+
     h_cam = ueye.HIDS(0)
     check(ueye.is_InitCamera(h_cam, None), "is_InitCamera")
     try:
@@ -71,9 +80,21 @@ def main():
             img = ueye.get_data(mem_ptr, width, height, bits_per_pixel, pitch, copy=True)
             frame = np.reshape(img, (height.value, width.value))
 
+            filename = f"exposure_{exposure_ms:.3f}ms.png"
+            out_path = os.path.join(out_dir, filename)
+
+            cv2.imwrite(out_path, frame)
+
             mx = int(frame.max())
             sat = int((frame == 255).sum())
             print("  max pixel:", mx, " saturated px:", sat)
+
+            time.sleep(1)
+
+        
+
+            
+
 
         # Cleanup
         ueye.is_StopLiveVideo(h_cam, ueye.IS_FORCE_VIDEO_STOP)

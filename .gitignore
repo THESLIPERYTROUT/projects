@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 venv-1/
 venv
+**/output/**

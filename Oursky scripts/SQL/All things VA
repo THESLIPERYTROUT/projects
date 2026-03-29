@@ -1,0 +1,222 @@
+WITH observation_count_by_node AS (
+    SELECT 
+        observations.node_id,
+        DATE(observations.time_utc) AS observation_date,  -- Extract date for bucketing
+        CASE 
+            WHEN search_instruction_id IS NOT NULL THEN 'Search' 
+            WHEN survey_instruction_id IS NOT NULL THEN 'Survey' 
+            ELSE 'Target' 
+        END AS instruction_type,
+        COUNT(*) AS observation_count
+    FROM observations
+    JOIN image_sets ON observations.id = image_sets.observation_id
+    WHERE observations.time_utc > NOW() - INTERVAL '{{lookback_days}} day' 
+      AND observations.state != 'underway'
+    GROUP BY 1, 2, 3  -- Group by node_id, date, and instruction_type
+)
+SELECT
+    nodes.name,
+    observation_count_by_node.observation_date,  -- Include date in the output
+    observation_count_by_node.instruction_type,  -- Include instruction type
+    observation_count_by_node.observation_count  -- Observation count per day
+FROM observation_count_by_node
+LEFT JOIN nodes ON nodes.id = observation_count_by_node.node_id
+WHERE nodes.name like '%Node0_%' or nodes.name like '%EC_V%' or nodes.name like '%VA%'
+ORDER BY nodes.name, observation_count_by_node.observation_date;
+
+
+
+
+
+
+
+with intreseted_nodes as (
+    select nodes.name, nodes.state, nodes.id
+    from nodes
+    where nodes.name like '%Node0_%' and nodes.state not in ('superseded', 'decommissioned')
+),
+observation_count_by_node as (
+    select observations.node_id, case when search_instruction_id is not null then 'Search' when survey_instruction_id is not null then 'Survey' else 'Target' end as instruction_type, count(*) as observation_count
+    from observations
+    join intreseted_nodes on observations.node_id = intreseted_nodes.id
+    join image_sets on observations.id = image_sets.observation_id
+    where observations.time_utc > now() - interval '{{lookback_days}} day' and observations.state != 'underway'
+    group by 1,2
+),
+image_sets_with_streaks as (
+    select extracted_streaks.node_id, count(distinct image_sets.id) as image_sets_with_streaks_count, case when search_instruction_id is not null then 'Search' when survey_instruction_id is not null then 'Survey' else 'Target' end as instruction_type
+    from extracted_streaks
+    join intreseted_nodes on extracted_streaks.node_id = intreseted_nodes.id
+    join image_set_images on image_set_images.id = extracted_streaks.image_id
+    join image_sets on image_set_images.image_set_id = image_sets.id
+    join observations on observations.id = image_sets.observation_id
+    where 
+        observations.time_utc > now() - interval '{{lookback_days}} day' and observations.state != 'underway'
+    group by 1,3
+),
+obs_sequence_count_by_node as (
+    select image_sets.node_id, count(*) as obs_sequence_count, case when search_instruction_id is not null then 'Search' when survey_instruction_id is not null then 'Survey' else 'Target' end as instruction_type
+    from observation_sequence_results 
+    join image_sets on observation_sequence_results.image_set_id = image_sets.id
+    join observations on observations.id = image_sets.observation_id
+    join intreseted_nodes on intreseted_nodes.id = image_sets.node_id
+    where 
+        observations.time_utc > now() - interval '{{lookback_days}} day'
+    group by 1,3
+)
+select
+    nodes.name,
+    -- observation_count_by_node.node_id,
+    observation_count_by_node.instruction_type, 
+    observation_count_by_node.observation_count,
+    image_sets_with_streaks_count,
+    coalesce(obs_sequence_count, 0) as obs_sequence_count,
+    
+    100.0 * coalesce(image_sets_with_streaks_count,0) / observation_count_by_node.observation_count as "Image Set / Observation %",
+    100.0 * coalesce(obs_sequence_count,0) / coalesce(image_sets_with_streaks_count,1) as "OSR / Image Set %"
+from observation_count_by_node
+join intreseted_nodes on observation_count_by_node.node_id = intreseted_nodes.id
+left join image_sets_with_streaks 
+    on image_sets_with_streaks.node_id = observation_count_by_node.node_id and image_sets_with_streaks.instruction_type = observation_count_by_node.instruction_type
+left join obs_sequence_count_by_node 
+    on obs_sequence_count_by_node.node_id = observation_count_by_node.node_id and obs_sequence_count_by_node.instruction_type = observation_count_by_node.instruction_type
+left join nodes
+    on nodes.id = observation_count_by_node.node_id
+where nodes.name like '%Node0_%' or nodes.name like '%EC_V%' or nodes.name like '%VA%'
+order by nodes.name
+
+
+
+
+
+
+
+
+with observation_count_by_node as (
+    select observations.node_id, case when search_instruction_id is not null then 'Search' when survey_instruction_id is not null then 'Survey' else 'Target' end as instruction_type, count(*) as observation_count
+    from observations
+    join image_sets on observations.id = image_sets.observation_id
+    where observations.time_utc > now() - interval '{{lookback_days}} day' and observations.state != 'underway' 
+    group by 1,2
+)
+select
+    nodes.name,
+    -- observation_count_by_node.node_id,
+    observation_count_by_node.observation_count
+from observation_count_by_node
+left join nodes
+    on nodes.id = observation_count_by_node.node_id
+where nodes.name like '%Node0_%' or nodes.name like '%EC_V%' or nodes.name like '%VA%'
+order by nodes.name
+
+
+
+
+
+
+
+
+with observation_count_by_node as (
+    select image_sets.node_id, count(*) as obs_sequence_count, case when search_instruction_id is not null then 'Search' when survey_instruction_id is not null then 'Survey' else 'Target' end as instruction_type,
+    case when observation_sequence_results.target_id = image_sets.target_id THEN 'primary' ELSE 'secondary' END AS result_type
+    from observation_sequence_results
+    join image_sets on observation_sequence_results.image_set_id = image_sets.id
+    join observations on observations.id = image_sets.observation_id
+    where 
+        observations.time_utc > now() - interval '{{lookback_days}} day'
+    group by image_sets.node_id, instruction_type, result_type
+)
+select
+    nodes.name,
+    -- observation_count_by_node.node_id,
+    observation_count_by_node.obs_sequence_count
+from observation_count_by_node
+left join nodes
+    on nodes.id = observation_count_by_node.node_id
+where nodes.name like '%Node0_%' or nodes.name like '%EC_V%' or nodes.name like '%VA%'
+order by nodes.name
+    
+
+
+
+
+
+
+
+
+with intreseted_nodes as (
+    select nodes.name, nodes.state, nodes.id
+    from nodes
+    where nodes.name like '%Node0_%' and nodes.state not in ('superseded', 'decommissioned')
+),
+image_sets_with_streaks as (
+    select extracted_streaks.node_id, count(distinct image_sets.id) as image_sets_with_streaks_count, case when search_instruction_id is not null then 'Search' when survey_instruction_id is not null then 'Survey' else 'Target' end as instruction_type
+    from extracted_streaks
+    join intreseted_nodes on extracted_streaks.node_id = intreseted_nodes.id
+    join image_set_images on image_set_images.id = extracted_streaks.image_id
+    join image_sets on image_set_images.image_set_id = image_sets.id
+    join observations on observations.id = image_sets.observation_id
+    where 
+        observations.time_utc > now() - interval '{{lookback_days}} day' and observations.state != 'underway'
+    group by 1,3
+)
+select
+    nodes.name, image_sets_with_streaks_count
+from nodes
+join image_sets_with_streaks on nodes.id = image_sets_with_streaks.node_id 
+where nodes.name like '%Node0_%' or nodes.name like '%EC_V%' or nodes.name like '%VA%'
+order by nodes.name
+
+
+
+
+
+
+with observation_count_by_node as (
+    select image_sets.node_id, count(*) as obs_sequence_count, case when search_instruction_id is not null then 'Search' when survey_instruction_id is not null then 'Survey' else 'Target' end as instruction_type,
+    case when observation_sequence_results.target_id = image_sets.target_id THEN 'primary' ELSE 'secondary' END AS result_type
+    from observation_sequence_results
+    join image_sets on observation_sequence_results.image_set_id = image_sets.id
+    join observations on observations.id = image_sets.observation_id
+    where 
+        observations.time_utc > now() - interval '{{lookback_days}} day'
+    group by image_sets.node_id, instruction_type, result_type
+)
+select
+    nodes.name,
+    -- observation_count_by_node.node_id,
+    observation_count_by_node.obs_sequence_count
+from observation_count_by_node
+left join nodes
+    on nodes.id = observation_count_by_node.node_id
+where nodes.name like '%Node0_%' or nodes.name like '%EC_V%' or nodes.name like '%VA%' and result_type != 'secondary'
+order by nodes.name
+    
+
+
+
+
+
+
+
+
+
+with observation_count_by_node as (
+    select image_sets.node_id, count(*) as obs_sequence_count, case when search_instruction_id is not null then 'Search' when survey_instruction_id is not null then 'Survey' else 'Target' end as instruction_type,
+    case when observation_sequence_results.target_id = image_sets.target_id THEN 'primary' ELSE 'secondary' END AS result_type
+    from observation_sequence_results
+    join image_sets on observation_sequence_results.image_set_id = image_sets.id
+    join observations on observations.id = image_sets.observation_id
+    where 
+        observations.time_utc > now() - interval '{{lookback_days}} day'
+    group by image_sets.node_id, instruction_type, result_type
+)
+select
+    nodes.name,
+    -- observation_count_by_node.node_id,
+    observation_count_by_node.obs_sequence_count
+from observation_count_by_node
+left join nodes
+    on nodes.id = observation_count_by_node.node_id
+where nodes.name like '%Node0_%' or nodes.name like '%EC_V%' or nodes.name like '%VA%' and result_type != 'primary'
+order by nodes.name

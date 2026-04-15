@@ -122,6 +122,11 @@ def build_load_list(loads, supports):
 
     if rank < A.shape[1]:
         raise ValueError("The system is statically indeterminate or has insufficient supports to solve for reactions.")
+
+    if not np.allclose(A @ reactions, b, atol=1e-8, rtol=1e-8):
+        raise ValueError(
+            "Support configuration is unstable or incompatible with the applied loads."
+        )
     
     # Inject reactions back as point loads/moments
     
@@ -134,6 +139,7 @@ def build_load_list(loads, supports):
         if unknown["dof"] == "Fy": force[1] = value
         if unknown["dof"] == "Fz": force[2] = value
         if unknown["dof"] == "Fx": force[0] = value
+        if unknown["dof"] == "Mx": moment[0] = value
 
         reaction_loads.append({
             "type":     "reaction",
@@ -278,19 +284,19 @@ def plot_mohrs_circle(critical_idx, x_arr, results, material_properties):
     ax.plot(center, 0, "ko", markersize=4)
 
     # current stress state point A (sigma_x, -tau_xy) and B (sigma_y, +tau_xy)
-    ax.plot(sigma_x,  -tau_xy, "o", color="coral",    markersize=8, label=f"Point A  (σ={sigma_x/1e6:.1f} MPa, τ={-tau_xy/1e6:.1f} MPa)")
-    ax.plot(sigma_y,  +tau_xy, "o", color="steelblue", markersize=8, label=f"Point B  (σ={sigma_y/1e6:.1f} MPa, τ={+tau_xy/1e6:.1f} MPa)")
+    ax.plot(sigma_x,  -tau_xy, "o", color="coral",    markersize=8, label=f"Point A  (sigma={sigma_x/1e6:.1f} MPa, tau={-tau_xy/1e6:.1f} MPa)")
+    ax.plot(sigma_y,  +tau_xy, "o", color="steelblue", markersize=8, label=f"Point B  (sigma={sigma_y/1e6:.1f} MPa, tau={+tau_xy/1e6:.1f} MPa)")
 
     # diameter line A to B
     ax.plot([sigma_x, sigma_y], [-tau_xy, tau_xy],
             color="gray", linewidth=0.8, linestyle="--")
 
     # principal stress points on sigma axis
-    ax.plot(sigma_1, 0, "^", color="red",   markersize=9, label=f"σ₁ = {sigma_1/1e6:.2f} MPa")
-    ax.plot(sigma_2, 0, "v", color="green", markersize=9, label=f"σ₂ = {sigma_2/1e6:.2f} MPa")
+    ax.plot(sigma_1, 0, "^", color="red",   markersize=9, label=f"sigma_1 = {sigma_1/1e6:.2f} MPa")
+    ax.plot(sigma_2, 0, "v", color="green", markersize=9, label=f"sigma_2 = {sigma_2/1e6:.2f} MPa")
 
     # max shear point
-    ax.plot(center, tau_max, "s", color="purple", markersize=8, label=f"τ_max = {tau_max/1e6:.2f} MPa")
+    ax.plot(center, tau_max, "s", color="purple", markersize=8, label=f"tau_max = {tau_max/1e6:.2f} MPa")
 
     # reference lines
     ax.axhline(0, color="black", linewidth=0.5)
@@ -301,9 +307,9 @@ def plot_mohrs_circle(critical_idx, x_arr, results, material_properties):
                 xytext=(center, radius * 0.15),
                 ha="center", fontsize=9, color="black")
 
-    ax.set_xlabel("Normal stress σ (Pa)")
-    ax.set_ylabel("Shear stress τ (Pa)")
-    ax.set_title(f"Mohr's circle — critical section x = {x_c:.4f} m")
+    ax.set_xlabel("Normal stress sigma (Pa)")
+    ax.set_ylabel("Shear stress tau (Pa)")
+    ax.set_title(f"Mohr's circle - critical section x = {x_c:.4f} m")
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8, loc="upper right")
@@ -313,14 +319,14 @@ def plot_mohrs_circle(critical_idx, x_arr, results, material_properties):
 
     # print summary
     print(f"\n--- Principal stress summary (x = {x_c:.4f} m) ---")
-    print(f"  σ_x      = {sigma_x/1e6:.2f} MPa")
-    print(f"  τ_xy     = {tau_xy/1e6:.2f} MPa")
+    print(f"  sigma_x  = {sigma_x/1e6:.2f} MPa")
+    print(f"  tau_xy   = {tau_xy/1e6:.2f} MPa")
     print(f"  Center C = {center/1e6:.2f} MPa")
     print(f"  Radius R = {radius/1e6:.2f} MPa")
-    print(f"  σ₁       = {sigma_1/1e6:.2f} MPa")
-    print(f"  σ₂       = {sigma_2/1e6:.2f} MPa")
-    print(f"  τ_max    = {tau_max/1e6:.2f} MPa")
-    print(f"  θ_p      = {theta_p:.2f}°  (principal angle, 2D convention)")
+    print(f"  sigma_1  = {sigma_1/1e6:.2f} MPa")
+    print(f"  sigma_2  = {sigma_2/1e6:.2f} MPa")
+    print(f"  tau_max  = {tau_max/1e6:.2f} MPa")
+    print(f"  theta_p  = {theta_p:.2f} deg  (principal angle, 2D convention)")
 
 def critical_section_heatmap(critical_idx, results, material_properties):
     d = material_properties["diameter"]
@@ -384,6 +390,21 @@ def debug_reactions(all_loads, loads):
     print(f"  ΣMy = {sum(l['moment'][1] + l['force'][2] * l['position'] for l in all_loads):.4f} N·m")
     print(f"  ΣMz = {sum(l['moment'][2] - l['force'][1] * l['position'] for l in all_loads):.4f} N·m")
 
+def validate_global_equilibrium(all_loads, atol=1e-6):
+    residuals = {
+        "sum_fx": sum(l["force"][0] for l in all_loads),
+        "sum_fy": sum(l["force"][1] for l in all_loads),
+        "sum_fz": sum(l["force"][2] for l in all_loads),
+        "sum_mx": sum(l["moment"][0] for l in all_loads),
+        "sum_my": sum(l["moment"][1] - l["force"][2] * l["position"] for l in all_loads),
+        "sum_mz": sum(l["moment"][2] + l["force"][1] * l["position"] for l in all_loads),
+    }
+
+    if not all(np.isclose(value, 0.0, atol=atol) for value in residuals.values()):
+        raise ValueError(f"Global equilibrium check failed: {residuals}")
+
+    return residuals
+
 if __name__ == "__main__":
 
     #build mesh
@@ -391,6 +412,7 @@ if __name__ == "__main__":
 
     #solve reactions and build unified load list
     all_loads = build_load_list(loads, supports)
+    validate_global_equilibrium(all_loads)
     print(reactions := [load for load in all_loads if load["type"] == "reaction"])
 
     # --- compute internal load diagrams ---
@@ -404,9 +426,9 @@ if __name__ == "__main__":
     critical_idx = np.argmax(sigma_vm)
     critical_x   = x_arr[critical_idx]
     print(f"Critical section at x = {critical_x:.4f} m")
-    print(f"  σ_vm = {sigma_vm[critical_idx]/1e6:.2f} MPa")
-    print(f"  σ    = {sigma[critical_idx]/1e6:.2f} MPa")
-    print(f"  τ    = {tau[critical_idx]/1e6:.2f} MPa")
+    print(f"  sigma_vm = {sigma_vm[critical_idx]/1e6:.2f} MPa")
+    print(f"  sigma    = {sigma[critical_idx]/1e6:.2f} MPa")
+    print(f"  tau      = {tau[critical_idx]/1e6:.2f} MPa")
 
     plot_diagrams(x_arr, results, critical_x)
 

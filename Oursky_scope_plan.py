@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 # function handling API call and data processing
-def get_weather(lat, lon, units='metric', key='db98887c21d08c99b463ba97957717a4'):  
+def get_weather(lat, lon, units='metric', key=''):  
     url = f"https://api.openweathermap.org/data/3.0/onecall?lat={lat}&lon={lon}&exclude=minutely,current&units={units}&appid={key}"
     weather_call = requests.get(url)
     if weather_call.status_code == 200:  #successful call  

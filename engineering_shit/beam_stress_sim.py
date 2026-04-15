@@ -75,6 +75,22 @@ def build_load_list(loads, supports):
             statics_solver_matrix.append(col_Fz)
             unknowns.append({"dof": "Fy", "position": d})
             unknowns.append({"dof": "Fz", "position": d})
+        elif support["type"] == "fixed":
+            d = support["position"]
+            
+            col_Fx = [1,  0,  0,  0,  0,  0]
+            col_Fy = [0,  1,  0,  0,  0,  d]
+            col_Fz = [0,  0,  1,  0, -d,  0]
+            col_Mx = [0,  0,  0,  1,  0,  0]
+            
+            statics_solver_matrix.append(col_Fx)
+            statics_solver_matrix.append(col_Fy)
+            statics_solver_matrix.append(col_Fz)
+            statics_solver_matrix.append(col_Mx)
+            unknowns.append({"dof": "Fx", "position": d})
+            unknowns.append({"dof": "Fy", "position": d})
+            unknowns.append({"dof": "Fz", "position": d})
+            unknowns.append({"dof": "Mx", "position": d})
         else:
             raise NotImplementedError(f"Support type '{support['type']}' not implemented")
 

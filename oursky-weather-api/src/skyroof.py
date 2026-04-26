@@ -1,0 +1,132 @@
+import re
+import os
+
+LOG_PATH = os.environ.get('SKYROOF_LOG_PATH', 'skyroof.log')
+MAX_HISTORY = 20
+
+# Matches both the one-line data file and the multi-entry log (which prefixes with "N)  " and
+# appends "Status:[...] Scope=... Roof=...")
+LINE_RE = re.compile(
+    r'(?:^\s*\d+\)\s+)?'                  # optional index (log file only)
+    r'(\d{4}-\d{2}-\d{2})\s+'             # date
+    r'(\d{2}:\d{2}:\d{2}\.\d+)\s+'        # time
+    r'([CF])\s+'                           # temp_scale  (C/F)
+    r'([MK])\s+'                           # wind_scale  (M=Mph, K=Knots)
+    r'([-\d.]+)\s+'                        # sky_temp
+    r'([-\d.]+)\s+'                        # ambient_temp
+    r'([-\d.]+)\s+'                        # sensor_temp
+    r'([\d.]+)\s+'                         # wind_speed
+    r'([\d.]+)\s+'                         # humidity
+    r'([-\d.]+)\s+'                        # dew_point
+    r'(\d+)\s+'                            # dew_heater_pct
+    r'(\d+)\s+'                            # rain_flag   (raw)
+    r'(\d+)\s+'                            # wet_flag    (raw)
+    r'(\d+)\s+'                            # elapsed_sec
+    r'([\d.]+)\s+'                         # elapsed_days (Julian)
+    r'([123])\s+'                          # cloud_flag  (1=Clear,2=Light Clouds,3=Very Cloudy)
+    r'([123])\s+'                          # wind_flag   (1=Calm,2=Windy,3=Very Windy)
+    r'([123])\s+'                          # rain_cond   (1=Dry,2=Damp,3=Rain)
+    r'([123])\s+'                          # darkness    (1=Dark,2=Dim,3=Daylight)
+    r'(\d+)\s+'                            # roof_close_flag
+    r'(\d+)'                               # alert_flag  (0=OK,1=Alert)
+    r'(?:\s+Status:\[([^\]]+)\]'           # status      (log only)
+    r'\s+Scope=(\S+)'                      # scope       (log only)
+    r'\s+Roof=(\S+))?',                    # roof        (log only)
+    re.IGNORECASE | re.MULTILINE
+)
+
+CLOUD_LABELS  = {'1': 'Clear', '2': 'Light Clouds', '3': 'Very Cloudy'}
+WIND_LABELS   = {'1': 'Calm',  '2': 'Windy',        '3': 'Very Windy'}
+RAIN_LABELS   = {'1': 'Dry',   '2': 'Damp',         '3': 'Rain'}
+DARK_LABELS   = {'1': 'Dark',  '2': 'Dim',           '3': 'Daylight'}
+
+
+def _to_c(f_val: float) -> float:
+    return round((f_val - 32) * 5 / 9, 1)
+
+
+def parse_line(line: str) -> dict | None:
+    m = LINE_RE.search(line)
+    if not m:
+        return None
+
+    (date, time_, temp_scale, wind_scale,
+     sky_temp, ambient_temp, sensor_temp,
+     wind_speed, humidity, dew_point,
+     dew_heater, rain_flag_raw, wet_flag_raw,
+     elapsed_sec, elapsed_days,
+     cloud_flag, wind_flag, rain_cond, darkness,
+     roof_close_flag, alert_flag,
+     status, scope, roof) = m.groups()
+
+    fahrenheit = temp_scale.upper() == 'F'
+    mph = wind_scale.upper() == 'M'
+
+    def maybe_c(v):
+        return _to_c(float(v)) if fahrenheit else float(v)
+
+    ambient = float(ambient_temp)
+    sky     = float(sky_temp)
+    dew     = float(dew_point)
+
+    return {
+        'timestamp':        f'{date} {time_}',
+        'date':             date,
+        'time':             time_[:8],
+        'temp_scale':       temp_scale.upper(),
+        'wind_scale':       'Mph' if mph else 'Knots',
+
+        'sky_temp':         sky,
+        'sky_temp_c':       maybe_c(sky_temp) if fahrenheit else sky,
+        'ambient_temp':     ambient,
+        'ambient_temp_c':   maybe_c(ambient_temp) if fahrenheit else ambient,
+        'sensor_temp':      float(sensor_temp),
+
+        'wind_speed':       float(wind_speed),
+        'humidity':         float(humidity),
+        'dew_point':        dew,
+        'dew_point_c':      maybe_c(dew_point) if fahrenheit else dew,
+        'dew_heater_pct':   int(dew_heater),
+
+        'rain_flag_raw':    int(rain_flag_raw),
+        'wet_flag_raw':     int(wet_flag_raw),
+        'elapsed_sec':      int(elapsed_sec),
+
+        'cloud_flag':       int(cloud_flag),
+        'cloud_label':      CLOUD_LABELS.get(cloud_flag, cloud_flag),
+        'wind_flag':        int(wind_flag),
+        'wind_label':       WIND_LABELS.get(wind_flag, wind_flag),
+        'rain_cond':        int(rain_cond),
+        'rain_label':       RAIN_LABELS.get(rain_cond, rain_cond),
+        'darkness':         int(darkness),
+        'darkness_label':   DARK_LABELS.get(darkness, darkness),
+
+        'roof_close_flag':  int(roof_close_flag),
+        'alert':            int(alert_flag) == 1,
+        'alert_flag':       int(alert_flag),
+
+        # log-only fields (None when reading the one-line data file)
+        'status':           status,
+        'scope':            scope,
+        'roof':             roof,
+    }
+
+
+def read_log(path: str = LOG_PATH, max_lines: int = MAX_HISTORY) -> list[dict]:
+    if not os.path.isfile(path):
+        return []
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        lines = [l for l in f.readlines() if l.strip()]
+    parsed = []
+    for line in reversed(lines):
+        entry = parse_line(line)
+        if entry:
+            parsed.append(entry)
+            if len(parsed) >= max_lines:
+                break
+    return parsed
+
+
+def latest(path: str = LOG_PATH) -> dict | None:
+    entries = read_log(path, max_lines=1)
+    return entries[0] if entries else None

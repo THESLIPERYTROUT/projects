@@ -1,6 +1,6 @@
 from flask import Flask, jsonify, request, render_template
 from src.weather import VA, Namibia, Chile, SRO, awoa, Wolongbar, Brazil
-from src.skyroof import latest, read_log, LOG_PATH
+from src.skyroof import latest, read_log, read_action_log, LOG_PATH, ACTION_LOG_PATH
 import os
 
 app = Flask(__name__)
@@ -31,11 +31,16 @@ def skyroof_dashboard():
 
 @app.route('/api/skyroof')
 def skyroof_data():
-    log_path = request.args.get('log', LOG_PATH)
+    log_path    = request.args.get('log',    LOG_PATH)
+    action_path = request.args.get('actions', ACTION_LOG_PATH)
     entries = read_log(log_path)
     if not entries:
         return jsonify({'error': f'No data found at {log_path}'}), 404
-    return jsonify({'latest': entries[0], 'history': entries})
+    return jsonify({
+        'latest':  entries[0],
+        'history': entries,
+        'actions': read_action_log(action_path),
+    })
 
 if __name__ == '__main__':
     app.run(debug=True)

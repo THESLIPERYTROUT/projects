@@ -1,3 +1,6 @@
+from .utils import get_weather
+
+
 class Weather:
     def __init__(self, lat, lon, site_name=None):
         self.lat = lat

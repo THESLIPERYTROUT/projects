@@ -1,8 +1,17 @@
 import re
 import os
+from datetime import datetime
 
-LOG_PATH = os.environ.get('SKYROOF_LOG_PATH', 'skyroof.log')
+LOG_PATH = os.environ.get(
+    'SKYROOF_LOG_PATH',
+    r'C:\Users\oursky\Documents\Interactiveastronomy\SkyRoof\weatherfilelog.txt'
+)
+ACTION_LOG_PATH = os.environ.get(
+    'SKYROOF_ACTION_LOG_PATH',
+    r'C:\Users\oursky\Documents\Interactiveastronomy\SkyRoof\skyroof_log.txt'
+)
 MAX_HISTORY = 20
+MAX_ACTIONS = 30
 
 # Matches both the one-line data file and the multi-entry log (which prefixes with "N)  " and
 # appends "Status:[...] Scope=... Roof=...")
@@ -130,3 +139,72 @@ def read_log(path: str = LOG_PATH, max_lines: int = MAX_HISTORY) -> list[dict]:
 def latest(path: str = LOG_PATH) -> dict | None:
     entries = read_log(path, max_lines=1)
     return entries[0] if entries else None
+
+
+# ── Roof action log (skyroof_log.txt) ────────────────────────────────────────
+
+ACTION_RE = re.compile(
+    r'^\s*(\d{2}-\d{2}-\d{4})\s+'   # date MM-DD-YYYY
+    r'(\d{1,2}:\d{2}:\d{2}\s+[AP]M)'  # time H:MM:SS AM/PM
+    r':\s+(.+)$',                    # message
+    re.IGNORECASE
+)
+
+# Keywords → (action_type, display label)
+_ACTION_PATTERNS = [
+    (r'did not open.*unsafe',           'blocked',    'Did not open — unsafe conditions'),
+    (r'did not open',                   'blocked',    'Did not open'),
+    (r'dusk.?dawn.*closed|closed.*dusk.?dawn', 'scheduled_close', 'Closed — scheduled dusk/dawn'),
+    (r'closed.*cloudiness|cloudiness',  'cloud_close','Closed — excessive cloudiness'),
+    (r'closed.*rain|rain.*closed',      'rain_close', 'Closed — rain detected'),
+    (r'closed.*wind|wind.*closed',      'wind_close', 'Closed — high wind'),
+    (r'opened|re-opened|re.opened',     'open',       'Opened'),
+    (r'closed',                         'close',      'Closed'),
+]
+
+def _classify_action(message: str) -> tuple[str, str]:
+    msg_lower = message.lower()
+    for pattern, atype, label in _ACTION_PATTERNS:
+        if re.search(pattern, msg_lower):
+            return atype, label
+    return 'unknown', message.strip()
+
+
+def parse_action_line(line: str) -> dict | None:
+    m = ACTION_RE.match(line.strip())
+    if not m:
+        return None
+    date_str, time_str, message = m.groups()
+    action_type, action_label = _classify_action(message)
+    try:
+        dt = datetime.strptime(f'{date_str} {time_str.strip()}', '%m-%d-%Y %I:%M:%S %p')
+        timestamp = dt.strftime('%Y-%m-%d %H:%M:%S')
+        date_fmt  = dt.strftime('%b %d, %Y')
+        time_fmt  = dt.strftime('%I:%M %p').lstrip('0')
+    except ValueError:
+        timestamp = f'{date_str} {time_str.strip()}'
+        date_fmt  = date_str
+        time_fmt  = time_str.strip()
+    return {
+        'timestamp':    timestamp,
+        'date':         date_fmt,
+        'time':         time_fmt,
+        'message':      message.strip(),
+        'action_type':  action_type,
+        'action_label': action_label,
+    }
+
+
+def read_action_log(path: str = ACTION_LOG_PATH, max_lines: int = MAX_ACTIONS) -> list[dict]:
+    if not os.path.isfile(path):
+        return []
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        lines = [l for l in f.readlines() if l.strip()]
+    parsed = []
+    for line in reversed(lines):
+        entry = parse_action_line(line)
+        if entry:
+            parsed.append(entry)
+            if len(parsed) >= max_lines:
+                break
+    return parsed

@@ -136,6 +136,51 @@
       border-radius: 10px; padding: 1.2rem 1.5rem;
       color: #f85149; display: none; margin-bottom: 1.5rem;
     }
+
+    /* ── Roof action timeline ── */
+    .section-divider { margin: 2rem 0 1rem; }
+
+    .timeline { display: flex; flex-direction: column; gap: 0; }
+
+    .tl-item {
+      display: flex;
+      gap: 1rem;
+      padding: .6rem 0;
+      border-bottom: 1px solid #161b22;
+      align-items: flex-start;
+    }
+    .tl-item:last-child { border-bottom: none; }
+
+    .tl-icon {
+      width: 28px; height: 28px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: .9rem; flex-shrink: 0; margin-top: .1rem;
+    }
+    .tl-icon.open            { background: #0d2818; border: 1px solid #2ea043; }
+    .tl-icon.cloud_close     { background: #2d1117; border: 1px solid #da3633; }
+    .tl-icon.scheduled_close { background: #2b1d0e; border: 1px solid #e3b341; }
+    .tl-icon.rain_close      { background: #2d1117; border: 1px solid #da3633; }
+    .tl-icon.wind_close      { background: #2d1117; border: 1px solid #da3633; }
+    .tl-icon.blocked         { background: #2b1d0e; border: 1px solid #f0883e; }
+    .tl-icon.close           { background: #2d1117; border: 1px solid #da3633; }
+    .tl-icon.unknown         { background: #161b22; border: 1px solid #30363d; }
+
+    .tl-body { flex: 1; }
+    .tl-label {
+      font-size: .85rem; font-weight: 600;
+      color: #e6edf3; margin-bottom: .15rem;
+    }
+    .tl-label.open            { color: #3fb950; }
+    .tl-label.cloud_close     { color: #f85149; }
+    .tl-label.scheduled_close { color: #e3b341; }
+    .tl-label.rain_close      { color: #f85149; }
+    .tl-label.wind_close      { color: #f85149; }
+    .tl-label.blocked         { color: #f0883e; }
+    .tl-label.close           { color: #f85149; }
+
+    .tl-time { font-size: .75rem; color: #8b949e; }
+
+    #no-actions { font-size: .82rem; color: #8b949e; padding: .5rem 0; }
   </style>
 </head>
 <body>
@@ -211,8 +256,18 @@
     <span style="margin-left:auto;color:#6e7681" id="elapsed-text"></span>
   </div>
 
+  <!-- Roof action timeline -->
+  <div class="section-divider">
+    <h2>Roof Action Log</h2>
+  </div>
+  <div class="timeline" id="action-timeline">
+    <div id="no-actions">No action log data available.</div>
+  </div>
+
   <!-- History -->
-  <h2>Recent Readings</h2>
+  <div class="section-divider" style="margin-top:2.5rem">
+    <h2>Recent Weather Readings</h2>
+  </div>
   <div class="table-wrap">
     <table>
       <thead>
@@ -299,6 +354,32 @@
       dot.className = d.alert ? 'dot alert' : (d.status === 'File Ok' ? 'dot' : 'dot warn');
       document.getElementById('status-text').textContent = 'File status: ' + (d.status || '—');
       document.getElementById('elapsed-text').textContent = d.elapsed_sec != null ? `Last write ${d.elapsed_sec}s ago` : '';
+
+      // Roof action timeline
+      const ICONS = {
+        open:            '🟢',
+        cloud_close:     '☁️',
+        scheduled_close: '🌙',
+        rain_close:      '🌧️',
+        wind_close:      '💨',
+        blocked:         '⚠️',
+        close:           '🔴',
+        unknown:         '❔',
+      };
+      const timeline = document.getElementById('action-timeline');
+      if (data.actions && data.actions.length) {
+        timeline.innerHTML = data.actions.map(a => `
+          <div class="tl-item">
+            <div class="tl-icon ${a.action_type}">${ICONS[a.action_type] || '❔'}</div>
+            <div class="tl-body">
+              <div class="tl-label ${a.action_type}">${a.action_label}</div>
+              <div class="tl-time">${a.date} &nbsp;·&nbsp; ${a.time}</div>
+            </div>
+          </div>
+        `).join('');
+      } else {
+        timeline.innerHTML = '<div id="no-actions">No action log data available.</div>';
+      }
 
       // History table
       const wUnit = d.wind_scale === 'Mph' ? 'mph' : 'kts';

@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OurSky — Observatory Status</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0a0c10;
+      color: #c9d1d9;
+      min-height: 100vh;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1rem 2rem;
+      border-bottom: 1px solid #21262d;
+      background: #0d1117;
+    }
+    header h1 { font-size: 1.2rem; font-weight: 600; color: #e6edf3; letter-spacing: .5px; }
+    header h1 span { color: #58a6ff; }
+    #last-updated { font-size: .78rem; color: #8b949e; }
+
+    main { padding: 2rem; max-width: 1000px; margin: 0 auto; }
+
+    /* ── Roof banner ── */
+    #roof-banner {
+      border-radius: 12px;
+      padding: 1.6rem 2rem;
+      display: flex;
+      align-items: center;
+      gap: 1.2rem;
+      margin-bottom: 2rem;
+      transition: background .4s, border-color .4s;
+    }
+    #roof-banner.open    { background: #0d2818; border: 1px solid #2ea043; }
+    #roof-banner.closed  { background: #2d1117; border: 1px solid #da3633; }
+    #roof-banner.unknown { background: #1c1c2e; border: 1px solid #6e40c9; }
+
+    #roof-icon  { font-size: 3rem; line-height: 1; }
+    #roof-label { font-size: 2.2rem; font-weight: 700; }
+    #roof-banner.open   #roof-label { color: #3fb950; }
+    #roof-banner.closed #roof-label { color: #f85149; }
+    #roof-banner.unknown #roof-label { color: #a371f7; }
+    #roof-sub { font-size: .85rem; color: #8b949e; margin-top: .2rem; }
+
+    .banner-right { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: .5rem; }
+
+    .badge {
+      padding: .35rem .9rem;
+      border-radius: 20px;
+      font-size: .85rem;
+      font-weight: 600;
+      border: 1px solid #30363d;
+      background: #161b22;
+      color: #c9d1d9;
+    }
+    .badge.alert { background: #2d1117; border-color: #da3633; color: #f85149; }
+
+    /* ── Stats grid ── */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+
+    .card {
+      background: #161b22;
+      border: 1px solid #21262d;
+      border-radius: 10px;
+      padding: 1.1rem 1.3rem;
+    }
+    .card .label { font-size: .7rem; color: #8b949e; text-transform: uppercase; letter-spacing: .6px; margin-bottom: .4rem; }
+    .card .value { font-size: 1.85rem; font-weight: 700; color: #e6edf3; line-height: 1.1; }
+    .card .unit  { font-size: .8rem;  color: #8b949e; margin-left: .15rem; }
+    .card .sub   { font-size: .75rem; color: #8b949e; margin-top: .3rem; }
+
+    /* condition pill colours */
+    .pill {
+      display: inline-block;
+      padding: .25rem .7rem;
+      border-radius: 12px;
+      font-size: .82rem;
+      font-weight: 600;
+      margin-top: .3rem;
+    }
+    .pill.good   { background: #0d2818; color: #3fb950; border: 1px solid #2ea04340; }
+    .pill.warn   { background: #2b1d0e; color: #f0883e; border: 1px solid #e3b34140; }
+    .pill.bad    { background: #2d1117; color: #f85149; border: 1px solid #da363340; }
+    .pill.dim    { background: #161b22; color: #8b949e; border: 1px solid #30363d; }
+
+    /* ── Status / alert bar ── */
+    #status-bar {
+      display: flex;
+      align-items: center;
+      gap: .6rem;
+      font-size: .82rem;
+      color: #8b949e;
+      margin-bottom: 2rem;
+      flex-wrap: wrap;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #3fb950; flex-shrink: 0; }
+    .dot.warn { background: #f0883e; }
+    .dot.alert { background: #f85149; }
+
+    /* ── History table ── */
+    h2 { font-size: 1rem; font-weight: 600; color: #c9d1d9; margin-bottom: .75rem; }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+    th {
+      text-align: left; padding: .5rem .75rem;
+      color: #8b949e; border-bottom: 1px solid #21262d;
+      font-weight: 500; text-transform: uppercase;
+      font-size: .68rem; letter-spacing: .5px; white-space: nowrap;
+    }
+    td { padding: .42rem .75rem; border-bottom: 1px solid #161b22; color: #c9d1d9; white-space: nowrap; }
+    tr:hover td { background: #161b22; }
+
+    .tag {
+      display: inline-block; padding: .12rem .5rem;
+      border-radius: 10px; font-size: .74rem; font-weight: 600;
+    }
+    .tag.open    { background: #0d2818; color: #3fb950; }
+    .tag.closed  { background: #2d1117; color: #f85149; }
+    .tag.unknown { background: #1c1c2e; color: #a371f7; }
+
+    #error-msg {
+      background: #2d1117; border: 1px solid #da3633;
+      border-radius: 10px; padding: 1.2rem 1.5rem;
+      color: #f85149; display: none; margin-bottom: 1.5rem;
+    }
+  </style>
+</head>
+<body>
+<header>
+  <h1><span>OurSky</span> Observatory Status</h1>
+  <span id="last-updated">Loading…</span>
+</header>
+
+<main>
+  <div id="error-msg">Could not load log data. Check the server can read the SkyRoof log file.</div>
+
+  <!-- Roof banner -->
+  <div id="roof-banner" class="unknown">
+    <span id="roof-icon">🔭</span>
+    <div>
+      <div id="roof-label">—</div>
+      <div id="roof-sub">—</div>
+    </div>
+    <div class="banner-right">
+      <span class="badge" id="scope-badge">Scope: —</span>
+      <span class="badge" id="alert-badge">No Alert</span>
+    </div>
+  </div>
+
+  <!-- Main stats -->
+  <div class="grid">
+    <div class="card">
+      <div class="label">Ambient Temp</div>
+      <div class="value" id="ambient">—<span class="unit" id="temp-unit">°F</span></div>
+      <div class="sub" id="ambient-alt"></div>
+    </div>
+    <div class="card">
+      <div class="label">Sky Temp</div>
+      <div class="value" id="sky-temp">—<span class="unit" id="sky-unit">°F</span></div>
+      <div class="sub" id="sky-alt"></div>
+    </div>
+    <div class="card">
+      <div class="label">Dew Point</div>
+      <div class="value" id="dew">—<span class="unit" id="dew-unit">°F</span></div>
+      <div class="sub" id="dew-alt"></div>
+    </div>
+    <div class="card">
+      <div class="label">Humidity</div>
+      <div class="value" id="humidity">—<span class="unit">%</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Wind Speed</div>
+      <div class="value" id="wind">—<span class="unit" id="wind-unit">mph</span></div>
+      <div class="sub" id="wind-label"></div>
+    </div>
+    <div class="card">
+      <div class="label">Dew Heater</div>
+      <div class="value" id="heater">—<span class="unit">%</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Sky Condition</div>
+      <div class="sub" style="margin-top:.6rem" id="cloud-pill"></div>
+    </div>
+    <div class="card">
+      <div class="label">Rain Condition</div>
+      <div class="sub" style="margin-top:.6rem" id="rain-pill"></div>
+    </div>
+    <div class="card">
+      <div class="label">Darkness</div>
+      <div class="sub" style="margin-top:.6rem" id="dark-pill"></div>
+    </div>
+  </div>
+
+  <!-- Status bar -->
+  <div id="status-bar">
+    <span class="dot" id="status-dot"></span>
+    <span id="status-text">—</span>
+    <span style="margin-left:auto;color:#6e7681" id="elapsed-text"></span>
+  </div>
+
+  <!-- History -->
+  <h2>Recent Readings</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Roof</th>
+          <th>Ambient</th>
+          <th>Sky Temp</th>
+          <th>Humidity</th>
+          <th>Wind</th>
+          <th>Sky</th>
+          <th>Rain</th>
+          <th>Darkness</th>
+          <th>Alert</th>
+        </tr>
+      </thead>
+      <tbody id="history-body"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+  function pillClass(flag, goodVal, warnVal) {
+    if (flag === goodVal) return 'good';
+    if (flag === warnVal) return 'warn';
+    return 'bad';
+  }
+
+  function pill(label, cls) {
+    return `<span class="pill ${cls}">${label}</span>`;
+  }
+
+  async function refresh() {
+    try {
+      const res = await fetch('/api/skyroof');
+      if (!res.ok) throw new Error(res.statusText);
+      const data = await res.json();
+
+      document.getElementById('error-msg').style.display = 'none';
+      document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+
+      const d = data.latest;
+      if (!d) return;
+
+      // Roof banner
+      const roofStatus = (d.roof || '').toLowerCase();
+      const banner = document.getElementById('roof-banner');
+      banner.className = roofStatus === 'open' ? 'open' : roofStatus === 'closed' ? 'closed' : 'unknown';
+      document.getElementById('roof-icon').textContent   = roofStatus === 'open' ? '🔭' : roofStatus === 'closed' ? '🏠' : '❓';
+      document.getElementById('roof-label').textContent  = d.roof ? 'Roof ' + d.roof : 'Roof Unknown';
+      document.getElementById('roof-sub').textContent    = d.timestamp;
+      document.getElementById('scope-badge').textContent = 'Scope: ' + (d.scope || '—');
+
+      const alertBadge = document.getElementById('alert-badge');
+      alertBadge.textContent = d.alert ? '⚠ Alert' : 'No Alert';
+      alertBadge.className   = 'badge' + (d.alert ? ' alert' : '');
+
+      // Temps
+      const unit = d.temp_scale === 'F' ? '°F' : '°C';
+      const altUnit = d.temp_scale === 'F' ? '°C' : '°F';
+      document.querySelectorAll('#temp-unit,#sky-unit,#dew-unit').forEach(el => el.textContent = unit);
+
+      document.getElementById('ambient').childNodes[0].textContent = d.ambient_temp;
+      document.getElementById('ambient-alt').textContent = d.ambient_temp_c + ' °C';
+      document.getElementById('sky-temp').childNodes[0].textContent = d.sky_temp;
+      document.getElementById('sky-alt').textContent = d.sky_temp_c + ' °C';
+      document.getElementById('dew').childNodes[0].textContent = d.dew_point;
+      document.getElementById('dew-alt').textContent = d.dew_point_c + ' °C';
+
+      // Other readings
+      document.getElementById('humidity').childNodes[0].textContent = d.humidity;
+      document.getElementById('wind').childNodes[0].textContent = d.wind_speed;
+      document.getElementById('wind-unit').textContent = d.wind_scale === 'Mph' ? ' mph' : ' kts';
+      document.getElementById('wind-label').textContent = d.wind_label;
+      document.getElementById('heater').childNodes[0].textContent = d.dew_heater_pct;
+
+      // Condition pills
+      document.getElementById('cloud-pill').innerHTML = pill(d.cloud_label, pillClass(d.cloud_flag, 1, 2));
+      document.getElementById('rain-pill').innerHTML  = pill(d.rain_label,  pillClass(d.rain_cond,  1, 2));
+      document.getElementById('dark-pill').innerHTML  = pill(d.darkness_label, d.darkness === 1 ? 'good' : d.darkness === 2 ? 'warn' : 'dim');
+
+      // Status bar
+      const dot = document.getElementById('status-dot');
+      dot.className = d.alert ? 'dot alert' : (d.status === 'File Ok' ? 'dot' : 'dot warn');
+      document.getElementById('status-text').textContent = 'File status: ' + (d.status || '—');
+      document.getElementById('elapsed-text').textContent = d.elapsed_sec != null ? `Last write ${d.elapsed_sec}s ago` : '';
+
+      // History table
+      const wUnit = d.wind_scale === 'Mph' ? 'mph' : 'kts';
+      document.getElementById('history-body').innerHTML = data.history.map(r => `
+        <tr>
+          <td>${r.time}</td>
+          <td><span class="tag ${(r.roof||'unknown').toLowerCase()}">${r.roof || '—'}</span></td>
+          <td>${r.ambient_temp} ${unit}</td>
+          <td>${r.sky_temp} ${unit}</td>
+          <td>${r.humidity}%</td>
+          <td>${r.wind_speed} ${wUnit}</td>
+          <td>${r.cloud_label}</td>
+          <td>${r.rain_label}</td>
+          <td>${r.darkness_label}</td>
+          <td>${r.alert ? '⚠' : '—'}</td>
+        </tr>
+      `).join('');
+
+    } catch (e) {
+      document.getElementById('error-msg').style.display = 'block';
+      document.getElementById('last-updated').textContent = 'Error — ' + e.message;
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 20000);
+</script>
+</body>
+</html>

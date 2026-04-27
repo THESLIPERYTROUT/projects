@@ -237,8 +237,6 @@ def compute_deflection(x_arr, results, material_properties):
     return theta_y, theta_z, delta_y, delta_z
 
 
-
-
 def compute_stress(x_arr, results, material_properties):
     d  = material_properties["diameter"]
     E  = material_properties["young_modulus"]

@@ -186,6 +186,59 @@ def compute_internal_loads(x_arr, all_loads):
 
     return results
 
+def compute_deflection(x_arr, results, material_properties):
+    d = material_properties["diameter"]
+    E = material_properties["young_modulus"]
+    I = np.pi * d**4 / 64
+
+    theta_y_raw = np.zeros(len(x_arr))
+    theta_z_raw = np.zeros(len(x_arr))
+    delta_y_raw = np.zeros(len(x_arr))
+    delta_z_raw = np.zeros(len(x_arr))
+
+    for i in range(len(x_arr)):
+        theta_y_raw[i] = np.trapezoid(results["M_z"][:i+1], x_arr[:i+1]) / (E * I)
+        theta_z_raw[i] = np.trapezoid(results["M_y"][:i+1], x_arr[:i+1]) / (E * I)
+
+    for i in range(len(x_arr)):
+        delta_y_raw[i] = np.trapezoid(theta_y_raw[:i+1], x_arr[:i+1])
+        delta_z_raw[i] = np.trapezoid(theta_z_raw[:i+1], x_arr[:i+1])
+
+    x_left = x_arr[0]
+    x_right = x_arr[-1]
+
+    # Solve:
+    # delta(left)  = delta_raw(left)  + C1*x_left  + C2 = 0
+    # delta(right) = delta_raw(right) + C1*x_right + C2 = 0
+    A = np.array([
+        [x_left,  1],
+        [x_right, 1],
+    ])
+
+    b_y = np.array([
+        -delta_y_raw[0],
+        -delta_y_raw[-1],
+    ])
+
+    b_z = np.array([
+        -delta_z_raw[0],
+        -delta_z_raw[-1],
+    ])
+
+    C1_y, C2_y = np.linalg.solve(A, b_y)
+    C1_z, C2_z = np.linalg.solve(A, b_z)
+
+    theta_y = theta_y_raw + C1_y
+    theta_z = theta_z_raw + C1_z
+
+    delta_y = delta_y_raw + C1_y * x_arr + C2_y
+    delta_z = delta_z_raw + C1_z * x_arr + C2_z
+
+    return theta_y, theta_z, delta_y, delta_z
+
+
+
+
 def compute_stress(x_arr, results, material_properties):
     d  = material_properties["diameter"]
     E  = material_properties["young_modulus"]
@@ -213,22 +266,44 @@ def compute_stress(x_arr, results, material_properties):
     return sigma, tau, sigma_vm
 
 def plot_diagrams(x_arr, results, critical_x):
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig, axes = plt.subplots(3, 2, figsize=(16, 10))
 
-    diagrams = [
+    load_diagrams = [
         ("V_y", "Shear V_y (N)",        axes[0, 0]),
         ("V_z", "Shear V_z (N)",        axes[0, 1]),
-        ("M_y", "Bending M_y (N·m)",    axes[1, 0]),
-        ("M_z", "Bending M_z (N·m)",    axes[1, 1]),
-        ("T",   "Torsion T (N·m)",      axes[0, 2]),
-        ("N",   "Axial N (N)",          axes[1, 2]),
+        ("M_y", "Bending M_y (N*m)",    axes[1, 0]),
+        ("M_z", "Bending M_z (N*m)",    axes[1, 1]),
+        ("T",   "Torsion T (N*m)",      axes[2, 0]),
+        ("N",   "Axial N (N)",          axes[2, 1]),
     ]
 
-    for key, title, ax in diagrams:
+    for key, title, ax in load_diagrams:
         ax.plot(x_arr, results[key], color="steelblue", linewidth=1.5)
         ax.axhline(0, color="black", linewidth=0.5, linestyle="--")
         ax.axvline(critical_x, color="red", linewidth=1, linestyle="--", label="critical section")
         ax.fill_between(x_arr, results[key], alpha=0.15, color="steelblue")
+        ax.set_title(title)
+        ax.set_xlabel("x (m)")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+
+    deflection_diagrams = [
+        ("theta_y", "Slope theta_y (rad)",    axes[0, 0]),
+        ("theta_z", "Slope theta_z (rad)",    axes[0, 1]),
+        ("delta_y", "Deflection delta_y (m)", axes[1, 0]),
+        ("delta_z", "Deflection delta_z (m)", axes[1, 1]),
+    ]
+
+    for key, title, ax in deflection_diagrams:
+        ax.plot(x_arr, results[key], color="darkorange", linewidth=1.5)
+        ax.axhline(0, color="black", linewidth=0.5, linestyle="--")
+        ax.axvline(critical_x, color="red", linewidth=1, linestyle="--", label="critical section")
+        ax.fill_between(x_arr, results[key], alpha=0.15, color="darkorange")
         ax.set_title(title)
         ax.set_xlabel("x (m)")
         ax.legend(fontsize=8)
@@ -418,6 +493,12 @@ if __name__ == "__main__":
     # --- compute internal load diagrams ---
     results = compute_internal_loads(x_arr, all_loads)
     #debug_reactions(all_loads, loads)
+
+    theta_y, theta_z, delta_y, delta_z = compute_deflection(x_arr, results, material_properties)
+    results["theta_y"] = theta_y
+    results["theta_z"] = theta_z
+    results["delta_y"] = delta_y
+    results["delta_z"] = delta_z
 
     #stress recovery along beam centerline
     sigma, tau, sigma_vm = compute_stress(x_arr, results, material_properties)

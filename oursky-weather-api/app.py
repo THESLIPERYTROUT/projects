@@ -1,6 +1,8 @@
 from flask import Flask, jsonify, request, render_template
 from src.weather import VA, Namibia, Chile, SRO, awoa, Wolongbar, Brazil
 from src.skyroof import latest, read_log, read_action_log, LOG_PATH, ACTION_LOG_PATH
+from src.storage import save_reading, get_history_for_chart
+from src.chart import get_forecast
 import os
 
 app = Flask(__name__)
@@ -36,11 +38,20 @@ def skyroof_data():
     entries = read_log(log_path)
     if not entries:
         return jsonify({'error': f'No data found at {log_path}'}), 404
+    save_reading(entries[0])
     return jsonify({
         'latest':  entries[0],
         'history': entries,
         'actions': read_action_log(action_path),
     })
 
+@app.route('/api/chart/<site>')
+def chart_data(site):
+    result = get_forecast(site)
+    if not result:
+        return jsonify({'error': f'Forecast unavailable for {site}'}), 503
+    result['history'] = get_history_for_chart()
+    return jsonify(result)
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)

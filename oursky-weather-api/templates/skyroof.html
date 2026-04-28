@@ -182,6 +182,11 @@
 
     #no-actions { font-size: .82rem; color: #8b949e; padding: .5rem 0; }
 
+    /* ── Map ── */
+    #map-card { border-radius: 10px; overflow: hidden; border: 1px solid #21262d; height: 220px; }
+    #obs-map  { height: 100%; width: 100%; }
+    .leaflet-container { background: #0d1117 !important; }
+
     /* ── Weather charts ── */
     .chart-header {
       display: flex; align-items: center; justify-content: space-between;
@@ -220,14 +225,20 @@
     #chart-error   { font-size: .82rem; color: #f85149;  padding: .75rem 0; display: none; }
   </style>
   <!-- Chart.js + date adapter + annotation plugin -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
 <body>
 <header>
   <h1><span>OurSky</span> Observatory Status</h1>
-  <span id="last-updated">Loading…</span>
+  <nav style="display:flex;align-items:center;gap:1.2rem;font-size:.82rem">
+    <a href="/night" style="color:#58a6ff;text-decoration:none">Night Detail</a>
+    <a href="/calendar" style="color:#58a6ff;text-decoration:none">Clear Sky Calendar</a>
+    <span id="last-updated" style="color:#8b949e">Loading…</span>
+  </nav>
 </header>
 
 <main>
@@ -241,7 +252,6 @@
       <div id="roof-sub">—</div>
     </div>
     <div class="banner-right">
-      <span class="badge" id="scope-badge">Scope: —</span>
       <span class="badge" id="alert-badge">No Alert</span>
     </div>
   </div>
@@ -288,6 +298,11 @@
       <div class="label">Darkness</div>
       <div class="sub" style="margin-top:.6rem" id="dark-pill"></div>
     </div>
+  </div>
+
+  <!-- Observatory map -->
+  <div id="map-card" style="margin-bottom:1.5rem">
+    <div id="obs-map"></div>
   </div>
 
   <!-- Status bar -->
@@ -405,7 +420,6 @@
       document.getElementById('roof-icon').textContent   = roofStatus === 'open' ? '🔭' : roofStatus === 'closed' ? '🏠' : '❓';
       document.getElementById('roof-label').textContent  = d.roof ? 'Roof ' + d.roof : 'Roof Unknown';
       document.getElementById('roof-sub').textContent    = d.timestamp;
-      document.getElementById('scope-badge').textContent = 'Scope: ' + (d.scope || '—');
 
       const alertBadge = document.getElementById('alert-badge');
       alertBadge.textContent = d.alert ? '⚠ Alert' : 'No Alert';
@@ -546,13 +560,14 @@
     return ann;
   }
 
-  function makeChart(def, histData, fcData, annotations, showXAxis) {
+  function makeChart(def, histData, fcData, dailyFcData, annotations, showXAxis) {
     const ctx = document.getElementById(`chart-${def.id}`).getContext('2d');
 
-    const histPts = def.histKey
+    const histPts   = def.histKey
       ? histData.filter(d => d[def.histKey] != null).map(d => ({ x: d.ts, y: d[def.histKey] }))
       : [];
-    const fcPts = fcData.map(d => ({ x: d.ts, y: d[def.fcKey] }));
+    const fcPts     = fcData.map(d => ({ x: d.ts, y: d[def.fcKey] }));
+    const dailyPts  = (dailyFcData || []).map(d => ({ x: d.ts, y: d[def.fcKey] }));
 
     if (chartInstances[def.id]) chartInstances[def.id].destroy();
 
@@ -579,6 +594,17 @@
             pointRadius: 0,
             fill: false,
             tension: 0.3,
+          },
+          {
+            label: '8-day',
+            data: dailyPts,
+            borderColor: def.color + '55',
+            borderDash: [2, 4],
+            borderWidth: 1,
+            pointRadius: 3,
+            pointStyle: 'circle',
+            fill: false,
+            tension: 0,
           },
         ],
       },
@@ -639,7 +665,7 @@
 
       const ann = buildAnnotations(data.night_bands, data.now_ts, lastActions);
       CHART_DEFS.forEach((def, i) => {
-        makeChart(def, data.history, data.forecast, ann, i === CHART_DEFS.length - 1);
+        makeChart(def, data.history, data.forecast, data.daily_forecast || [], ann, i === CHART_DEFS.length - 1);
       });
     } catch (e) {
       document.getElementById('chart-loading').style.display = 'none';
@@ -678,6 +704,24 @@
 
   refresh();
   setInterval(refresh, 20000);
+
+  // ── Observatory map ───────────────────────────────────────────────────────
+  fetch('/api/config').then(r => r.json()).then(cfg => {
+    const map = L.map('obs-map', { zoomControl: true, attributionControl: true })
+                 .setView([cfg.obs_lat, cfg.obs_lon], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© <a href="https://openstreetmap.org/copyright">OpenStreetMap</a>',
+      maxZoom: 18,
+    }).addTo(map);
+    const icon = L.divIcon({
+      html: '<div style="background:#58a6ff;width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 6px #58a6ff88"></div>',
+      iconSize: [14, 14], iconAnchor: [7, 7], className: '',
+    });
+    L.marker([cfg.obs_lat, cfg.obs_lon], { icon })
+     .addTo(map)
+     .bindPopup(`<b>${cfg.obs_name}</b><br>${cfg.obs_lat.toFixed(4)}, ${cfg.obs_lon.toFixed(4)}`)
+     .openPopup();
+  });
 </script>
 </body>
 </html>

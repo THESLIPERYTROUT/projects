@@ -52,6 +52,7 @@ def get_forecast(site: str) -> dict | None:
     hourly = data.get('hourly', [])
     daily  = data.get('daily',  [])
 
+    # Hourly forecast — first 48 h, full resolution
     forecast = [
         {
             'ts':         h['dt'] * 1000,
@@ -61,6 +62,26 @@ def get_forecast(site: str) -> dict | None:
             'precip_pct': round(h.get('pop', 0) * 100),
         }
         for h in hourly
+    ]
+
+    # Daily forecast — days 3-8 (days 1-2 already covered by hourly above)
+    daily_forecast = [
+        {
+            'ts':         d['dt'] * 1000,
+            'temp_f':     round(d['temp']['day'], 1),
+            'cloud_pct':  d.get('clouds', 0),
+            'wind_mph':   round(d['wind_speed'], 1),
+            'precip_pct': round(d.get('pop', 0) * 100),
+        }
+        for d in daily[2:]   # skip days 0-1 which overlap with hourly
+    ]
+
+    # Sun times per day — used by the night detail view as fallback
+    sun_times = [
+        {'date': datetime.fromtimestamp(d['dt'], tz=timezone.utc).strftime('%Y-%m-%d'),
+         'sunrise_ts': d['sunrise'] * 1000,
+         'sunset_ts':  d['sunset']  * 1000}
+        for d in daily
     ]
 
     # Night bands: sunset[N] → sunrise[N+1]
@@ -78,9 +99,11 @@ def get_forecast(site: str) -> dict | None:
             })
 
     result = {
-        'forecast':    forecast,
-        'night_bands': night_bands,
-        'now_ts':      int(datetime.now(timezone.utc).timestamp() * 1000),
+        'forecast':       forecast,
+        'daily_forecast': daily_forecast,
+        'sun_times':      sun_times,
+        'night_bands':    night_bands,
+        'now_ts':         int(datetime.now(timezone.utc).timestamp() * 1000),
     }
     _cache[key] = (time.monotonic(), result)
     return result

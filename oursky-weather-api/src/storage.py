@@ -33,6 +33,18 @@ def init_db():
                 alert        INTEGER
             )
         ''')
+        # nightly_stats is never purged — grows permanently for the yearly calendar
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS nightly_stats (
+                date        TEXT PRIMARY KEY,  -- YYYY-MM-DD (evening date)
+                hours_open  REAL,
+                hours_total REAL,
+                cloud_avg   REAL,
+                temp_avg    REAL,
+                wind_avg    REAL,
+                updated_at  TEXT
+            )
+        ''')
 
 
 def save_reading(entry: dict):
@@ -131,3 +143,60 @@ def get_history_for_chart(hours: int = 48) -> list[dict]:
         r['cloud_approx_pct'] = CLOUD_PCT.get(cf)
 
     return rows
+
+
+# ── Nightly stats (permanent, never purged) ───────────────────────────────────
+
+INTERVAL_S = 20  # SkyRoof writes every ~20 seconds
+
+
+def compute_and_store_nightly_stats(date_str: str) -> dict | None:
+    """Compute stats for a completed night and upsert into nightly_stats.
+    Returns None if the night window hasn't ended yet or has no data.
+    """
+    data = get_night_data(date_str)
+    rows = data['rows']
+    if not rows:
+        return None
+
+    window_end_dt = datetime.fromtimestamp(data['window_end'] / 1000)
+    if window_end_dt > datetime.now():
+        return None  # night not yet complete
+
+    hours_total = len(rows) * INTERVAL_S / 3600
+    open_rows   = sum(1 for r in rows if (r.get('roof') or '').lower() == 'open')
+    hours_open  = open_rows * INTERVAL_S / 3600
+
+    def avg(key):
+        vals = [r[key] for r in rows if r.get(key) is not None]
+        return round(sum(vals) / len(vals), 2) if vals else None
+
+    stats = {
+        'date':        date_str,
+        'hours_open':  round(hours_open, 2),
+        'hours_total': round(hours_total, 2),
+        'cloud_avg':   avg('cloud_approx_pct'),
+        'temp_avg':    avg('ambient_temp'),
+        'wind_avg':    avg('wind_speed'),
+        'updated_at':  datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+    init_db()
+    with _connect() as conn:
+        conn.execute('''
+            INSERT OR REPLACE INTO nightly_stats
+                (date, hours_open, hours_total, cloud_avg, temp_avg, wind_avg, updated_at)
+            VALUES (:date, :hours_open, :hours_total, :cloud_avg, :temp_avg, :wind_avg, :updated_at)
+        ''', stats)
+
+    return stats
+
+
+def get_calendar_stats() -> list[dict]:
+    """Return all nightly stats ordered by date for the calendar heatmap."""
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            'SELECT date, hours_open, hours_total, cloud_avg, temp_avg, wind_avg FROM nightly_stats ORDER BY date ASC'
+        ).fetchall()
+    return [dict(r) for r in rows]

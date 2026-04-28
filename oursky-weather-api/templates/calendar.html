@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OurSky — Clear Sky Calendar</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0c10; color: #c9d1d9; min-height: 100vh; }
+
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 1rem 2rem; border-bottom: 1px solid #21262d; background: #0d1117;
+    }
+    header h1 { font-size: 1.2rem; font-weight: 600; color: #e6edf3; }
+    header h1 span { color: #58a6ff; }
+    header nav { font-size: .82rem; }
+    header nav a { color: #58a6ff; text-decoration: none; margin-left: 1.2rem; }
+    header nav a:hover { text-decoration: underline; }
+
+    main { padding: 2rem; max-width: 1000px; margin: 0 auto; }
+
+    /* ── Year selector ── */
+    .year-nav {
+      display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem;
+    }
+    .nav-btn {
+      background: #161b22; border: 1px solid #30363d; color: #c9d1d9;
+      padding: .35rem .85rem; border-radius: 6px; cursor: pointer; font-size: .9rem;
+    }
+    .nav-btn:hover { border-color: #58a6ff; color: #58a6ff; }
+    .nav-btn:disabled { opacity: .35; cursor: default; }
+    .year-label { font-size: 1.4rem; font-weight: 700; color: #e6edf3; min-width: 60px; text-align: center; }
+
+    /* ── Year summary strip ── */
+    .year-summary {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: .75rem; margin-bottom: 1.5rem;
+    }
+    .sum-card {
+      background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: .8rem 1rem;
+    }
+    .sum-card .label { font-size: .68rem; color: #8b949e; text-transform: uppercase; letter-spacing: .5px; margin-bottom: .3rem; }
+    .sum-card .value { font-size: 1.4rem; font-weight: 700; color: #e6edf3; }
+    .sum-card .unit  { font-size: .75rem; color: #8b949e; margin-left: .15rem; }
+
+    /* ── Heatmap ── */
+    .heatmap-wrap {
+      background: #0d1117; border: 1px solid #21262d; border-radius: 10px;
+      padding: 1.5rem; overflow-x: auto;
+    }
+
+    .month-labels {
+      display: flex; margin-left: 28px; margin-bottom: 4px;
+    }
+    .month-label {
+      font-size: .7rem; color: #8b949e; text-align: left; flex-shrink: 0;
+    }
+
+    .heatmap-grid { display: flex; gap: 3px; }
+
+    .day-col { display: flex; flex-direction: column; gap: 3px; }
+
+    .day-cell {
+      width: 13px; height: 13px; border-radius: 2px;
+      cursor: pointer; transition: opacity .15s;
+      position: relative;
+    }
+    .day-cell:hover { opacity: .75; }
+    .day-cell.empty { background: transparent; cursor: default; }
+
+    /* Weekday labels column */
+    .weekday-labels {
+      display: flex; flex-direction: column; gap: 3px;
+      margin-right: 4px; padding-top: 0;
+    }
+    .wd-label {
+      font-size: .65rem; color: #8b949e; height: 13px;
+      display: flex; align-items: center; width: 22px;
+    }
+
+    /* Legend */
+    .legend {
+      display: flex; align-items: center; gap: .5rem;
+      font-size: .72rem; color: #8b949e; margin-top: 1rem; justify-content: flex-end;
+    }
+    .legend-cell { width: 13px; height: 13px; border-radius: 2px; }
+
+    /* ── Tooltip ── */
+    #tooltip {
+      position: fixed; z-index: 1000; pointer-events: none;
+      background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+      padding: .6rem .9rem; font-size: .8rem; color: #c9d1d9;
+      box-shadow: 0 4px 16px #00000080; display: none; max-width: 200px;
+    }
+    #tooltip .tt-date  { font-weight: 600; color: #e6edf3; margin-bottom: .3rem; }
+    #tooltip .tt-row   { display: flex; justify-content: space-between; gap: .75rem; margin-top: .15rem; }
+    #tooltip .tt-label { color: #8b949e; }
+    #tooltip .tt-value { font-weight: 600; }
+
+    /* ── Monthly breakdown ── */
+    .monthly-wrap { margin-top: 2rem; }
+    .monthly-wrap h2 { font-size: 1rem; font-weight: 600; color: #c9d1d9; margin-bottom: .75rem; }
+    .month-bars { display: flex; flex-direction: column; gap: .5rem; }
+    .month-bar-row { display: flex; align-items: center; gap: .75rem; font-size: .82rem; }
+    .month-name { width: 36px; color: #8b949e; flex-shrink: 0; }
+    .bar-track { flex: 1; background: #161b22; border-radius: 4px; height: 18px; overflow: hidden; }
+    .bar-fill  { height: 100%; border-radius: 4px; background: #26a641; transition: width .3s; }
+    .bar-label { width: 60px; text-align: right; color: #8b949e; flex-shrink: 0; }
+
+    #no-data { color: #8b949e; font-size: .88rem; padding: 1.5rem 0; }
+  </style>
+</head>
+<body>
+<header>
+  <h1><span>OurSky</span> Clear Sky Calendar</h1>
+  <nav>
+    <a href="/skyroof">Live Dashboard</a>
+    <a href="/night">Night Detail</a>
+  </nav>
+</header>
+
+<main>
+  <div class="year-nav">
+    <button class="nav-btn" id="btn-prev-year">← {{ currentYear - 1 }}</button>
+    <span class="year-label" id="year-label">—</span>
+    <button class="nav-btn" id="btn-next-year" disabled>{{ currentYear + 1 }} →</button>
+  </div>
+
+  <div class="year-summary">
+    <div class="sum-card"><div class="label">Nights Recorded</div><div class="value" id="sum-nights">—</div></div>
+    <div class="sum-card"><div class="label">Total Hours Open</div><div class="value" id="sum-hours">—<span class="unit">h</span></div></div>
+    <div class="sum-card"><div class="label">Avg Hours / Night</div><div class="value" id="sum-avg">—<span class="unit">h</span></div></div>
+    <div class="sum-card"><div class="label">Best Night</div><div class="value" id="sum-best">—<span class="unit">h</span></div></div>
+    <div class="sum-card"><div class="label">Clearest Month</div><div class="value" id="sum-month" style="font-size:1rem;padding-top:.25rem">—</div></div>
+  </div>
+
+  <div id="no-data" style="display:none">No data recorded yet. The calendar fills in as the app runs nightly.</div>
+
+  <div class="heatmap-wrap" id="heatmap-wrap">
+    <div class="month-labels" id="month-labels"></div>
+    <div style="display:flex">
+      <div class="weekday-labels">
+        <div class="wd-label"></div><!-- Sun -->
+        <div class="wd-label">Mon</div>
+        <div class="wd-label"></div><!-- Tue -->
+        <div class="wd-label">Wed</div>
+        <div class="wd-label"></div><!-- Thu -->
+        <div class="wd-label">Fri</div>
+        <div class="wd-label"></div><!-- Sat -->
+      </div>
+      <div class="heatmap-grid" id="heatmap-grid"></div>
+    </div>
+    <div class="legend">
+      <span>Less</span>
+      <div class="legend-cell" style="background:#161b22;border:1px solid #30363d"></div>
+      <div class="legend-cell" style="background:#0e4429"></div>
+      <div class="legend-cell" style="background:#006d32"></div>
+      <div class="legend-cell" style="background:#26a641"></div>
+      <div class="legend-cell" style="background:#39d353"></div>
+      <span>More open time</span>
+    </div>
+  </div>
+
+  <div class="monthly-wrap">
+    <h2>Monthly Breakdown</h2>
+    <div class="month-bars" id="month-bars"></div>
+  </div>
+</main>
+
+<div id="tooltip">
+  <div class="tt-date" id="tt-date"></div>
+  <div class="tt-row"><span class="tt-label">Roof open</span><span class="tt-value" id="tt-open"></span></div>
+  <div class="tt-row"><span class="tt-label">Of total</span><span class="tt-value" id="tt-total"></span></div>
+  <div class="tt-row"><span class="tt-label">Avg cloud</span><span class="tt-value" id="tt-cloud"></span></div>
+  <div class="tt-row"><span class="tt-label">Avg temp</span><span class="tt-value" id="tt-temp"></span></div>
+</div>
+
+<script>
+  const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const MONTH_FULL  = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+  // Color scale: 0h = no-data gray, >0h maps to green gradient
+  function cellColor(hoursOpen, hasData) {
+    if (!hasData) return '#0d1117';
+    if (hoursOpen == null || hoursOpen === 0) return '#161b22';
+    if (hoursOpen < 1)  return '#0e2a18';
+    if (hoursOpen < 2)  return '#0e4429';
+    if (hoursOpen < 4)  return '#006d32';
+    if (hoursOpen < 6)  return '#26a641';
+    return '#39d353';
+  }
+
+  let allStats = {};   // date string → stat row
+  let currentYear = new Date().getFullYear();
+  const thisYear  = currentYear;
+  const tooltip   = document.getElementById('tooltip');
+
+  function showTooltip(e, stat, dateStr) {
+    const d = new Date(dateStr + 'T12:00:00');
+    document.getElementById('tt-date').textContent  =
+      d.toLocaleDateString('en-US', { weekday:'short', month:'long', day:'numeric', year:'numeric' });
+    document.getElementById('tt-open').textContent  =
+      stat ? stat.hours_open.toFixed(1) + 'h' : '—';
+    document.getElementById('tt-total').textContent =
+      stat ? (stat.hours_total > 0 ? Math.round(stat.hours_open / stat.hours_total * 100) + '%' : '—') : '—';
+    document.getElementById('tt-cloud').textContent =
+      stat?.cloud_avg != null ? Math.round(stat.cloud_avg) + '%' : '—';
+    document.getElementById('tt-temp').textContent  =
+      stat?.temp_avg  != null ? stat.temp_avg.toFixed(1) + '°F' : '—';
+    tooltip.style.display = 'block';
+    moveTooltip(e);
+  }
+
+  function moveTooltip(e) {
+    const x = e.clientX + 14, y = e.clientY - 10;
+    tooltip.style.left = Math.min(x, window.innerWidth  - 210) + 'px';
+    tooltip.style.top  = Math.min(y, window.innerHeight - 140) + 'px';
+  }
+
+  function hideTooltip() { tooltip.style.display = 'none'; }
+
+  function renderYear(year) {
+    document.getElementById('year-label').textContent = year;
+    document.getElementById('btn-prev-year').disabled = year <= thisYear - 5;
+    document.getElementById('btn-next-year').disabled = year >= thisYear;
+
+    // Collect this year's data
+    const yearStats = {};
+    Object.entries(allStats).forEach(([date, s]) => {
+      if (date.startsWith(year + '')) yearStats[date] = s;
+    });
+
+    // Year summary
+    const nights = Object.values(yearStats);
+    const totalH = nights.reduce((s, n) => s + (n.hours_open || 0), 0);
+    const bestN  = nights.reduce((b, n) => n.hours_open > (b?.hours_open || 0) ? n : b, null);
+    const monthly = Array.from({length:12}, (_, m) => {
+      const mo = String(m + 1).padStart(2, '0');
+      return nights.filter(n => n.date.slice(5,7) === mo)
+                   .reduce((s, n) => s + (n.hours_open || 0), 0);
+    });
+    const bestMoIdx = monthly.indexOf(Math.max(...monthly));
+
+    document.getElementById('sum-nights').textContent = nights.length || '—';
+    document.getElementById('sum-hours').innerHTML    = nights.length ? totalH.toFixed(0) + '<span class="unit">h</span>' : '—';
+    document.getElementById('sum-avg').innerHTML      = nights.length ? (totalH / nights.length).toFixed(1) + '<span class="unit">h</span>' : '—';
+    document.getElementById('sum-best').innerHTML     = bestN ? bestN.hours_open.toFixed(1) + '<span class="unit">h</span>' : '—';
+    document.getElementById('sum-month').textContent  = nights.length ? MONTH_FULL[bestMoIdx] : '—';
+
+    document.getElementById('no-data').style.display = nights.length ? 'none' : 'block';
+
+    // Build 52-week grid
+    const grid      = document.getElementById('heatmap-grid');
+    const monthLbls = document.getElementById('month-labels');
+    grid.innerHTML = '';
+    monthLbls.innerHTML = '';
+
+    // Start from Jan 1 of the year, aligned to Sunday
+    const jan1     = new Date(year, 0, 1);
+    const startDay = new Date(jan1);
+    startDay.setDate(jan1.getDate() - jan1.getDay()); // rewind to Sunday
+
+    const endDay = new Date(year, 11, 31);
+    const today  = new Date();
+
+    let d = new Date(startDay);
+    let weekIdx = 0;
+    let lastMonth = -1;
+    const monthPositions = [];
+
+    while (d <= endDay || d.getDay() !== 0) {
+      const col = document.createElement('div');
+      col.className = 'day-col';
+
+      for (let dow = 0; dow < 7; dow++) {
+        const cell = document.createElement('div');
+        const dateStr = d.toISOString().slice(0, 10);
+        const inYear  = d.getFullYear() === year;
+        const isFuture = d > today;
+
+        if (!inYear || isFuture) {
+          cell.className = 'day-cell empty';
+        } else {
+          const stat = yearStats[dateStr];
+          cell.className = 'day-cell';
+          cell.style.background = cellColor(stat?.hours_open, true);
+          cell.title = dateStr;
+          cell.addEventListener('mouseenter', e => showTooltip(e, stat || null, dateStr));
+          cell.addEventListener('mousemove',  moveTooltip);
+          cell.addEventListener('mouseleave', hideTooltip);
+          cell.addEventListener('click', () => { window.location.href = `/night/${dateStr}`; });
+        }
+
+        // Track month label positions
+        if (inYear && d.getDate() === 1) {
+          monthPositions.push({ month: d.getMonth(), week: weekIdx });
+        }
+
+        col.appendChild(cell);
+        d.setDate(d.getDate() + 1);
+      }
+      grid.appendChild(col);
+      weekIdx++;
+      if (d > endDay && d.getDay() === 0) break;
+    }
+
+    // Month labels
+    const cellW = 16; // 13px cell + 3px gap
+    monthPositions.forEach((mp, i) => {
+      const lbl = document.createElement('div');
+      lbl.className = 'month-label';
+      lbl.textContent = MONTH_NAMES[mp.month];
+      const nextWeek = i + 1 < monthPositions.length ? monthPositions[i+1].week : weekIdx;
+      lbl.style.width = ((nextWeek - mp.week) * cellW) + 'px';
+      monthLbls.appendChild(lbl);
+    });
+
+    // Monthly bars
+    const maxH  = Math.max(...monthly, 1);
+    document.getElementById('month-bars').innerHTML = monthly.map((h, m) => `
+      <div class="month-bar-row">
+        <div class="month-name">${MONTH_NAMES[m]}</div>
+        <div class="bar-track">
+          <div class="bar-fill" style="width:${(h / maxH * 100).toFixed(1)}%;background:${h > 0 ? '#26a641' : '#161b22'}"></div>
+        </div>
+        <div class="bar-label">${h > 0 ? h.toFixed(0) + 'h' : '—'}</div>
+      </div>
+    `).join('');
+  }
+
+  async function load() {
+    const res = await fetch('/api/calendar');
+    const rows = await res.json();
+    rows.forEach(r => { allStats[r.date] = r; });
+
+    // Find earliest year with data, default to this year
+    const years = rows.map(r => parseInt(r.date.slice(0,4)));
+    currentYear = years.length ? Math.max(...years.map(y => Math.min(y, thisYear))) : thisYear;
+
+    renderYear(currentYear);
+  }
+
+  document.getElementById('btn-prev-year').addEventListener('click', () => { currentYear--; renderYear(currentYear); });
+  document.getElementById('btn-next-year').addEventListener('click', () => { currentYear++; renderYear(currentYear); });
+
+  load();
+</script>
+</body>
+</html>

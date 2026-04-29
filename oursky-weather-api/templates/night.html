@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OurSky — Night Detail</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0c10; color: #c9d1d9; min-height: 100vh; }
+
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 1rem 2rem; border-bottom: 1px solid #21262d; background: #0d1117;
+    }
+    header h1 { font-size: 1.2rem; font-weight: 600; color: #e6edf3; }
+    header h1 span { color: #58a6ff; }
+    header nav { font-size: .82rem; color: #8b949e; }
+    header nav a { color: #58a6ff; text-decoration: none; }
+    header nav a:hover { text-decoration: underline; }
+
+    main { padding: 2rem; max-width: 1000px; margin: 0 auto; }
+
+    /* ── Night selector ── */
+    .night-nav {
+      display: flex; align-items: center; justify-content: center;
+      gap: 1.2rem; margin-bottom: 1.5rem;
+    }
+    .nav-btn {
+      background: #161b22; border: 1px solid #30363d; color: #c9d1d9;
+      padding: .45rem 1rem; border-radius: 6px; cursor: pointer;
+      font-size: .9rem; transition: border-color .15s;
+    }
+    .nav-btn:hover { border-color: #58a6ff; color: #58a6ff; }
+    .nav-btn:disabled { opacity: .35; cursor: default; border-color: #30363d; color: #8b949e; }
+    .night-title { font-size: 1.3rem; font-weight: 700; color: #e6edf3; min-width: 220px; text-align: center; }
+    .night-sub { font-size: .78rem; color: #8b949e; text-align: center; margin-top: .2rem; }
+
+    /* ── Summary strip ── */
+    .summary-strip {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: .75rem; margin-bottom: 1.5rem;
+    }
+    .sum-card {
+      background: #161b22; border: 1px solid #21262d; border-radius: 8px;
+      padding: .8rem 1rem;
+    }
+    .sum-card .label { font-size: .68rem; color: #8b949e; text-transform: uppercase; letter-spacing: .5px; margin-bottom: .3rem; }
+    .sum-card .value { font-size: 1.4rem; font-weight: 700; color: #e6edf3; }
+    .sum-card .unit  { font-size: .75rem; color: #8b949e; margin-left: .15rem; }
+
+    /* ── Charts ── */
+    .charts-wrap {
+      background: #0d1117; border: 1px solid #21262d; border-radius: 10px;
+      overflow: hidden; margin-bottom: 1.5rem;
+    }
+    .chart-row {
+      display: grid; grid-template-columns: 48px 1fr;
+      align-items: center; border-bottom: 1px solid #21262d; height: 220px;
+    }
+    .chart-row.bottom { height: 260px; border-bottom: none; }
+    .chart-y-label {
+      font-size: .63rem; color: #6e7681; text-align: center;
+      text-transform: uppercase; letter-spacing: .5px;
+      writing-mode: vertical-rl; transform: rotate(180deg); padding: .5rem 0;
+    }
+
+    /* ── Roof status bar ── */
+    .roof-bar-wrap {
+      margin-bottom: 1.5rem; border: 1px solid #21262d; border-radius: 10px; overflow: hidden;
+    }
+    .roof-bar-header {
+      background: #0d1117; padding: .5rem 1rem;
+      font-size: .72rem; color: #8b949e; text-transform: uppercase; letter-spacing: .5px;
+      border-bottom: 1px solid #21262d;
+    }
+    .roof-bar { display: flex; height: 36px; width: 100%; }
+    .roof-seg {
+      height: 100%; display: flex; align-items: center; justify-content: center;
+      font-size: .7rem; font-weight: 600; overflow: hidden; white-space: nowrap;
+      transition: opacity .2s; cursor: default;
+    }
+    .roof-seg.open    { background: #0d2818; color: #3fb950; border-right: 1px solid #2ea04330; }
+    .roof-seg.closed  { background: #2d1117; color: #f85149; border-right: 1px solid #da363330; }
+    .roof-seg.blocked { background: #2b1d0e; color: #f0883e; border-right: 1px solid #e3b34130; }
+    .roof-seg.unknown { background: #161b22; color: #6e7681; border-right: 1px solid #30363d30; }
+
+    /* ── Event list ── */
+    h2 { font-size: 1rem; font-weight: 600; color: #c9d1d9; margin-bottom: .75rem; }
+    .event-list { display: flex; flex-direction: column; gap: 0; }
+    .event-row {
+      display: flex; align-items: flex-start; gap: .9rem;
+      padding: .65rem 0; border-bottom: 1px solid #161b22;
+    }
+    .event-row:last-child { border-bottom: none; }
+    .ev-icon {
+      width: 30px; height: 30px; border-radius: 50%; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center; font-size: .95rem;
+    }
+    .ev-icon.open            { background: #0d2818; border: 1px solid #2ea043; }
+    .ev-icon.cloud_close     { background: #2d1117; border: 1px solid #da3633; }
+    .ev-icon.scheduled_close { background: #2b1d0e; border: 1px solid #e3b341; }
+    .ev-icon.rain_close,
+    .ev-icon.wind_close,
+    .ev-icon.close           { background: #2d1117; border: 1px solid #da3633; }
+    .ev-icon.blocked         { background: #2b1d0e; border: 1px solid #f0883e; }
+    .ev-icon.unknown         { background: #161b22; border: 1px solid #30363d; }
+    .ev-body { flex: 1; }
+    .ev-label { font-size: .9rem; font-weight: 600; }
+    .ev-label.open            { color: #3fb950; }
+    .ev-label.cloud_close,
+    .ev-label.rain_close,
+    .ev-label.wind_close,
+    .ev-label.close           { color: #f85149; }
+    .ev-label.scheduled_close { color: #e3b341; }
+    .ev-label.blocked         { color: #f0883e; }
+    .ev-time { font-size: .78rem; color: #8b949e; margin-top: .15rem; }
+    .ev-msg  { font-size: .78rem; color: #6e7681; margin-top: .1rem; font-style: italic; }
+
+    #no-data { color: #8b949e; font-size: .88rem; padding: 1.5rem 0; }
+    #no-events { color: #8b949e; font-size: .82rem; padding: .5rem 0; }
+  </style>
+</head>
+<body>
+<header>
+  <h1><span>OurSky</span> Night Detail</h1>
+  <nav style="display:flex;align-items:center;gap:1.4rem;font-size:.82rem">
+    <a href="/skyroof" style="color:#58a6ff;text-decoration:none">Live Dashboard</a>
+    <a href="/calendar" style="color:#58a6ff;text-decoration:none">Clear Sky Calendar</a>
+  </nav>
+</header>
+
+<main>
+  <div class="night-nav">
+    <button class="nav-btn" id="btn-prev">← Prev</button>
+    <div>
+      <div class="night-title" id="night-title">—</div>
+      <div class="night-sub" id="night-sub">—</div>
+    </div>
+    <button class="nav-btn" id="btn-next">Next →</button>
+  </div>
+
+  <div id="no-data" style="display:none">No recorded data for this night yet.</div>
+
+  <!-- Summary strip -->
+  <div class="summary-strip" id="summary-strip">
+    <div class="sum-card"><div class="label">Roof Open</div><div class="value" id="sum-open">—<span class="unit">h</span></div></div>
+    <div class="sum-card"><div class="label">Avg Cloud</div><div class="value" id="sum-cloud">—<span class="unit">%</span></div></div>
+    <div class="sum-card"><div class="label">Avg Temp</div><div class="value" id="sum-temp">—<span class="unit">°F</span></div></div>
+    <div class="sum-card"><div class="label">Avg Wind</div><div class="value" id="sum-wind">—<span class="unit">mph</span></div></div>
+    <div class="sum-card"><div class="label">Min Temp</div><div class="value" id="sum-tmin">—<span class="unit">°F</span></div></div>
+    <div class="sum-card"><div class="label">Max Wind</div><div class="value" id="sum-wmax">—<span class="unit">mph</span></div></div>
+  </div>
+
+  <!-- Roof status bar -->
+  <div class="roof-bar-wrap" id="roof-bar-wrap">
+    <div class="roof-bar-header">Roof Status</div>
+    <div class="roof-bar" id="roof-bar"></div>
+  </div>
+
+  <!-- Charts -->
+  <div class="charts-wrap" id="charts-wrap">
+    <div class="chart-row">
+      <div class="chart-y-label">Cloud %</div>
+      <canvas id="chart-cloud"></canvas>
+    </div>
+    <div class="chart-row">
+      <div class="chart-y-label">Temp °F</div>
+      <canvas id="chart-temp"></canvas>
+    </div>
+    <div class="chart-row bottom">
+      <div class="chart-y-label">Wind mph</div>
+      <canvas id="chart-wind"></canvas>
+    </div>
+  </div>
+
+  <!-- Event list -->
+  <h2>Roof Events</h2>
+  <div class="event-list" id="event-list">
+    <div id="no-events">No roof events recorded for this night.</div>
+  </div>
+</main>
+
+<script>
+  // ── Date helpers ─────────────────────────────────────────────────────────
+  function currentNightDate() {
+    const now = new Date();
+    // Before 10am → the night started yesterday evening
+    if (now.getHours() < 10) now.setDate(now.getDate() - 1);
+    return now.toISOString().slice(0, 10);
+  }
+
+  function addDays(dateStr, n) {
+    const d = new Date(dateStr + 'T12:00:00');
+    d.setDate(d.getDate() + n);
+    return d.toISOString().slice(0, 10);
+  }
+
+  function fmtNightTitle(dateStr) {
+    const d = new Date(dateStr + 'T12:00:00');
+    return 'Night of ' + d.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+  }
+
+  function fmtTime(ts) {
+    return new Date(ts).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  }
+
+  // ── State ────────────────────────────────────────────────────────────────
+  const defaultDate = '{{ default_date }}';
+  let currentDate   = defaultDate || currentNightDate();
+  const oldestDate  = addDays(currentNightDate(), -6);  // 7-day history window
+  const charts      = {};
+
+  // ── Chart annotations ────────────────────────────────────────────────────
+  const ICONS = { open:'🟢', cloud_close:'☁️', scheduled_close:'🌙', rain_close:'🌧️', wind_close:'💨', blocked:'⚠️', close:'🔴', unknown:'❔' };
+
+  function buildAnnotations(data) {
+    const ann = {};
+
+    // Night band (sunset → sunrise) from detected transitions or full window
+    const nightStart = data.sunset_ts  || data.window_start;
+    const nightEnd   = data.sunrise_ts || data.window_end;
+    ann.night = {
+      type: 'box', xMin: nightStart, xMax: nightEnd,
+      backgroundColor: 'rgba(0,4,28,0.5)', borderWidth: 0,
+    };
+
+    // Sunset / sunrise markers
+    if (data.sunset_ts) {
+      ann.sunset = { type: 'line', xMin: data.sunset_ts, xMax: data.sunset_ts,
+        borderColor: '#e3b34160', borderWidth: 1,
+        label: { content: 'Sunset', display: true, position: 'start', color: '#e3b341', font: { size: 9 }, padding: 3 } };
+    }
+    if (data.sunrise_ts) {
+      ann.sunrise = { type: 'line', xMin: data.sunrise_ts, xMax: data.sunrise_ts,
+        borderColor: '#f0883e60', borderWidth: 1,
+        label: { content: 'Sunrise', display: true, position: 'start', color: '#f0883e', font: { size: 9 }, padding: 3 } };
+    }
+
+    // Roof action vertical lines with full labels
+    data.actions.forEach((a, i) => {
+      const ts  = new Date(a.timestamp).getTime();
+      const col = a.action_type === 'open' ? '#3fb950' : a.action_type === 'blocked' ? '#f0883e' : '#f85149';
+      ann[`action_${i}`] = {
+        type: 'line', xMin: ts, xMax: ts,
+        borderColor: col, borderWidth: 2,
+        borderDash: a.action_type === 'blocked' ? [4, 3] : [],
+        label: {
+          content: a.action_type === 'open' ? '▲ Open' : a.action_type === 'blocked' ? '⚠ Blocked' : '▼ Closed',
+          display: true, position: 'start',
+          color: col, backgroundColor: '#0d1117',
+          font: { size: 9, weight: 'bold' }, padding: { x: 4, y: 2 },
+        },
+      };
+    });
+
+    return ann;
+  }
+
+  // ── Roof status bar ──────────────────────────────────────────────────────
+  function buildRoofBar(data) {
+    const bar = document.getElementById('roof-bar');
+    const winDuration = data.window_end - data.window_start;
+    const actions = [...data.actions].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    const segments = [];
+    let cursor = data.window_start;
+    let state  = 'unknown';
+
+    // Seed initial state from the current roof if available via the first action
+    for (const a of actions) {
+      const ts = new Date(a.timestamp).getTime();
+      segments.push({ start: cursor, end: ts, state });
+      state  = a.action_type === 'open' ? 'open' : a.action_type === 'blocked' ? 'blocked' : 'closed';
+      cursor = ts;
+    }
+    segments.push({ start: cursor, end: data.window_end, state });
+
+    bar.innerHTML = segments.map(seg => {
+      const pct = ((seg.end - seg.start) / winDuration * 100).toFixed(2);
+      const label = pct > 5 ? seg.state.replace('_', ' ') : '';
+      return `<div class="roof-seg ${seg.state}" style="width:${pct}%" title="${seg.state}: ${fmtTime(seg.start)} – ${fmtTime(seg.end)}">${label}</div>`;
+    }).join('');
+  }
+
+  // ── Summary stats ────────────────────────────────────────────────────────
+  function buildSummary(data) {
+    const rows = data.rows;
+    if (!rows.length) return;
+
+    const avg = key => {
+      const vals = rows.map(r => r[key]).filter(v => v != null);
+      return vals.length ? (vals.reduce((a, b) => a + b, 0) / vals.length) : null;
+    };
+    const min = key => Math.min(...rows.map(r => r[key]).filter(v => v != null));
+    const max = key => Math.max(...rows.map(r => r[key]).filter(v => v != null));
+
+    // Hours roof was open: count rows where roof === 'Open', each row ≈ 20s
+    const openRows = rows.filter(r => (r.roof || '').toLowerCase() === 'open').length;
+    const openHours = (openRows * 20 / 3600).toFixed(1);
+
+    const cloudAvg = avg('cloud_approx_pct');
+    const tempAvg  = avg('ambient_temp');
+    const windAvg  = avg('wind_speed');
+    const tempMin  = rows.length ? min('ambient_temp') : null;
+    const windMax  = rows.length ? max('wind_speed') : null;
+
+    document.getElementById('sum-open').innerHTML  = openHours + '<span class="unit">h</span>';
+    document.getElementById('sum-cloud').innerHTML = (cloudAvg != null ? Math.round(cloudAvg) : '—') + '<span class="unit">%</span>';
+    document.getElementById('sum-temp').innerHTML  = (tempAvg  != null ? tempAvg.toFixed(1)  : '—') + '<span class="unit">°F</span>';
+    document.getElementById('sum-wind').innerHTML  = (windAvg  != null ? windAvg.toFixed(1)  : '—') + '<span class="unit">mph</span>';
+    document.getElementById('sum-tmin').innerHTML  = (tempMin  != null ? tempMin.toFixed(1)  : '—') + '<span class="unit">°F</span>';
+    document.getElementById('sum-wmax').innerHTML  = (windMax  != null ? windMax.toFixed(1)  : '—') + '<span class="unit">mph</span>';
+  }
+
+  // ── Charts ───────────────────────────────────────────────────────────────
+  const CHART_DEFS = [
+    { id: 'cloud', key: 'cloud_approx_pct', color: '#58a6ff', yMin: 0, yMax: 100 },
+    { id: 'temp',  key: 'ambient_temp',     color: '#f0883e', yMin: null, yMax: null },
+    { id: 'wind',  key: 'wind_speed',       color: '#3fb950', yMin: 0, yMax: null },
+  ];
+
+  function renderCharts(data, annotations) {
+    const xMin = data.window_start;
+    const xMax = data.window_end;
+
+    CHART_DEFS.forEach((def, i) => {
+      const pts = data.rows
+        .filter(r => r[def.key] != null)
+        .map(r => ({ x: r.ts, y: r[def.key] }));
+
+      if (charts[def.id]) charts[def.id].destroy();
+      const ctx = document.getElementById(`chart-${def.id}`).getContext('2d');
+      const isBottom = i === CHART_DEFS.length - 1;
+
+      charts[def.id] = new Chart(ctx, {
+        type: 'line',
+        data: {
+          datasets: [{
+            data: pts,
+            borderColor: def.color,
+            backgroundColor: def.color + '18',
+            borderWidth: 1.5,
+            pointRadius: 0,
+            fill: true,
+            tension: 0.3,
+          }],
+        },
+        options: {
+          animation: false,
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false },
+            annotation: { annotations },
+            tooltip: {
+              mode: 'index', intersect: false,
+              backgroundColor: '#161b22', borderColor: '#30363d', borderWidth: 1,
+              titleColor: '#8b949e', bodyColor: '#c9d1d9',
+              callbacks: {
+                title: items => fmtTime(items[0].parsed.x),
+              },
+            },
+          },
+          scales: {
+            x: {
+              type: 'time',
+              min: xMin, max: xMax,
+              display: isBottom,
+              grid: { color: '#21262d' },
+              ticks: { color: '#8b949e', font: { size: 10 }, maxRotation: 0, maxTicksLimit: 12 },
+              time: { unit: 'hour', displayFormats: { hour: 'h aaa' } },
+            },
+            y: {
+              min: def.yMin ?? undefined,
+              max: def.yMax ?? undefined,
+              grid: { color: '#21262d' },
+              ticks: { color: '#8b949e', font: { size: 10 }, maxTicksLimit: 4 },
+            },
+          },
+        },
+      });
+    });
+  }
+
+  // ── Event list ───────────────────────────────────────────────────────────
+  function renderEvents(actions) {
+    const el = document.getElementById('event-list');
+    if (!actions.length) {
+      el.innerHTML = '<div id="no-events">No roof events recorded for this night.</div>';
+      return;
+    }
+    el.innerHTML = actions.map(a => `
+      <div class="event-row">
+        <div class="ev-icon ${a.action_type}">${ICONS[a.action_type] || '❔'}</div>
+        <div class="ev-body">
+          <div class="ev-label ${a.action_type}">${a.action_label}</div>
+          <div class="ev-time">${a.date} &nbsp;·&nbsp; ${a.time}</div>
+          <div class="ev-msg">${a.message}</div>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  // ── Load night ───────────────────────────────────────────────────────────
+  async function loadNight(date) {
+    currentDate = date;
+
+    document.getElementById('night-title').textContent = fmtNightTitle(date);
+    document.getElementById('night-sub').textContent   = 'Loading…';
+    document.getElementById('btn-prev').disabled = date <= oldestDate;
+    document.getElementById('btn-next').disabled = date >= currentNightDate();
+
+    try {
+      const res = await fetch(`/api/night/${date}`);
+      if (!res.ok) throw new Error(res.statusText);
+      const data = await res.json();
+
+      const hasData = data.rows && data.rows.length > 0;
+      document.getElementById('no-data').style.display       = hasData ? 'none' : 'block';
+      document.getElementById('summary-strip').style.display = hasData ? '' : 'none';
+      document.getElementById('roof-bar-wrap').style.display = hasData || data.actions.length ? '' : 'none';
+      document.getElementById('charts-wrap').style.display   = hasData ? '' : 'none';
+
+      // Sub-heading with sunset/sunrise if detected
+      if (data.sunset_ts && data.sunrise_ts) {
+        document.getElementById('night-sub').textContent =
+          `Sunset ${fmtTime(data.sunset_ts)} · Sunrise ${fmtTime(data.sunrise_ts)}`;
+      } else {
+        document.getElementById('night-sub').textContent = hasData ? '4 pm → 10 am window' : 'No data';
+      }
+
+      if (hasData) {
+        buildSummary(data);
+        const ann = buildAnnotations(data);
+        renderCharts(data, ann);
+      }
+      buildRoofBar(data);
+      renderEvents(data.actions);
+
+      // Update URL without reloading
+      history.replaceState(null, '', `/night/${date}`);
+    } catch (e) {
+      document.getElementById('night-sub').textContent = 'Error loading data';
+    }
+  }
+
+  // ── Nav buttons ──────────────────────────────────────────────────────────
+  document.getElementById('btn-prev').addEventListener('click', () => loadNight(addDays(currentDate, -1)));
+  document.getElementById('btn-next').addEventListener('click', () => loadNight(addDays(currentDate,  1)));
+
+  loadNight(currentDate);
+</script>
+</body>
+</html>

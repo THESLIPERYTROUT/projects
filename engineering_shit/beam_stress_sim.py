@@ -491,6 +491,12 @@ if __name__ == "__main__":
     # --- compute internal load diagrams ---
     results = compute_internal_loads(x_arr, all_loads)
     #debug_reactions(all_loads, loads)
+    Mz_max_idx = np.argmax(np.abs(results["M_z"]))
+    print(f"Maximum bending moment M_z = {results['M_z'][Mz_max_idx]:.2f} N·m at x = {x_arr[Mz_max_idx]:.4f} m")
+    My_max_idx = np.argmax(np.abs(results["M_y"]))
+    print(f"Maximum bending moment M_y = {results['M_y'][My_max_idx]:.2f} N·m at x = {x_arr[My_max_idx]:.4f} m")
+    M_total_max_idx = np.argmax(np.sqrt(results["M_y"]**2 + results["M_z"]**2))
+    print(f"Maximum resultant bending moment M_total = {np.sqrt(results['M_y'][M_total_max_idx]**2 + results['M_z'][M_total_max_idx]**2):.2f} N·m at x = {x_arr[M_total_max_idx]:.4f} m")
 
     theta_y, theta_z, delta_y, delta_z = compute_deflection(x_arr, results, material_properties)
     results["theta_y"] = theta_y
@@ -521,6 +527,11 @@ if __name__ == "__main__":
     #plot
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle(f"Critical section at x = {critical_x:.4f} m")
+
+    Sy = 200e6 # yield strength (Pa)
+    tau_max = np.nanmax(tau_cs)
+    factor_of_safety = Sy / (2 * tau_max)
+    print(f"Estimated factor of safety against yielding (using max shear): {factor_of_safety:.2f}")
 
     for ax, data, title in zip(
         axes,

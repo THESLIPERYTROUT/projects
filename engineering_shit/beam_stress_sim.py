@@ -29,13 +29,13 @@ loads = [
     {
         "type": "point_load",
         "position": 0.40,          
-        "force":  (0, -3760, -10340), 
+        "force":  (0, -3760, 10340), 
         "moment": (-3100, 0, 0),      
     },
     {
         "type": "point_load",
         "position": 0.75,
-        "force":  (0, -9640, 20660),
+        "force":  (0, -9640, -20660),
         "moment": (3100, 0, 0),
     },
 ]
@@ -400,6 +400,9 @@ def plot_mohrs_circle(critical_idx, x_arr, results, material_properties):
     print(f"  sigma_2  = {sigma_2/1e6:.2f} MPa")
     print(f"  tau_max  = {tau_max/1e6:.2f} MPa")
     print(f"  theta_p  = {theta_p:.2f} deg  (principal angle, 2D convention)")
+    print(f" theta_z = {results['theta_z'][critical_idx]:.6f} rad  (slope about z at critical section)")
+    print(f"  delta_z = {results['delta_z'][critical_idx]*1e3:.2f} mm  (deflection at critical section)")
+
 
 def critical_section_heatmap(critical_idx, results, material_properties):
     d = material_properties["diameter"]
@@ -532,6 +535,7 @@ if __name__ == "__main__":
     tau_max = np.nanmax(tau_cs)
     factor_of_safety = Sy / (2 * tau_max)
     print(f"Estimated factor of safety against yielding (using max shear): {factor_of_safety:.2f}")
+
 
     for ax, data, title in zip(
         axes,

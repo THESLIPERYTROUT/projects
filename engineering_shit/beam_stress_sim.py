@@ -23,11 +23,11 @@ material_properties = {
 #TODO Make inclusive to non-circular geometery
 geometry = [
     {"start": 0.00, "end": 0.03, "diameter": 0.03},
-    {"start": 0.03, "end": 0.385, "diameter": 0.06},
-    {"start": 0.385, "end": 0.425, "diameter": 0.075},
-    {"start": 0.425, "end": 0.755, "diameter": 0.1},
-    {"start": 0.755, "end": 0.795, "diameter": 0.090},
-    {"start": 0.795, "end": 1.05, "diameter": 0.08},
+    {"start": 0.03, "end": 0.385, "diameter": 0.04},
+    {"start": 0.385, "end": 0.425, "diameter": 0.05},
+    {"start": 0.425, "end": 0.755, "diameter": 0.075},
+    {"start": 0.755, "end": 0.795, "diameter": 0.05},
+    {"start": 0.795, "end": 1.05, "diameter": 0.042},
     {"start": 1.05, "end": 1.08, "diameter": 0.03}
 ]
 
@@ -104,6 +104,8 @@ def build_load_list(loads, supports):
             col_Fy = [0,  1,  0,  0,  0,  d]
             col_Fz = [0,  0,  1,  0, -d,  0]
             col_Mx = [0,  0,  0,  1,  0,  0]
+            col_My = [0,  0,  0,  0,  1,  0]
+            col_Mz = [0,  0,  0,  0,  0,  1]
 
             statics_solver_matrix.append(col_Fx)
             statics_solver_matrix.append(col_Fy)

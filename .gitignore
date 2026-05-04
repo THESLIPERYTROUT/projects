@@ -7,4 +7,4 @@ venv
 .claude/
 .claude-worktrees/
 .claude-worktree*/
-claude-worktrees/
+claude-worktrees/**

@@ -508,6 +508,12 @@ if __name__ == "__main__":
     print(f"  sigma_vm = {sigma_vm[critical_idx]/1e6:.2f} MPa")
     print(f"  sigma    = {sigma[critical_idx]/1e6:.2f} MPa")
     print(f"  tau      = {tau[critical_idx]/1e6:.2f} MPa")
+    print(f"  M_y      = {results['M_y'][critical_idx]:.2f} N·m")
+    print(f"  M_z      = {results['M_z'][critical_idx]:.2f} N·m")
+    M_total = np.sqrt(results["M_y"][critical_idx]**2 + results["M_z"][critical_idx]**2)
+    print(f"  M_total  = {M_total:.2f} N·m")
+    Torque = results["T"][critical_idx]
+    print(f"  T        = {Torque:.2f} N·m")
 
     plot_diagrams(x_arr, results, critical_x)
 

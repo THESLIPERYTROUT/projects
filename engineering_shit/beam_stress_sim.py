@@ -3,13 +3,13 @@ import numpy as np
 
 #Units: SI (m, N, N·m, Pa)
 
-length = 1.05
-mesh_density_factor = 0.01
+length = 1.08
+mesh_density_factor = 0.0025
 simulated_points = int(length / mesh_density_factor)
 
 supports = [
-    {"position": 0.0,    "type": "bearing"},
-    {"position": length, "type": "bearing"},
+    {"position": 0.015,    "type": "bearing"},
+    {"position": length-0.015, "type": "bearing"},
 ]
 
 material_properties = {
@@ -18,22 +18,29 @@ material_properties = {
     "density": 7850,
 }
 
-# Each segment defines a shaft section with a given diameter.
+# Each segment defines a shaft section with a given diameter. 
 # Segments must be contiguous and together span the full beam length.
+#TODO Make inclusive to non-circular geometery
 geometry = [
-    {"start": 0.00, "end": 1.05, "diameter": 0.05},
+    {"start": 0.00, "end": 0.03, "diameter": 0.03},
+    {"start": 0.03, "end": 0.385, "diameter": 0.06},
+    {"start": 0.385, "end": 0.425, "diameter": 0.075},
+    {"start": 0.425, "end": 0.755, "diameter": 0.1},
+    {"start": 0.755, "end": 0.795, "diameter": 0.090},
+    {"start": 0.795, "end": 1.05, "diameter": 0.08},
+    {"start": 1.05, "end": 1.08, "diameter": 0.03}
 ]
 
 loads = [
     {
         "type": "point_load",
-        "position": 0.40,
+        "position": 0.415,
         "force":  (0, -3760, 10340),
         "moment": (-3100, 0, 0),
     },
     {
         "type": "point_load",
-        "position": 0.75,
+        "position": 0.765,
         "force":  (0, -9640, -20660),
         "moment": (3100, 0, 0),
     },
@@ -252,7 +259,6 @@ def compute_deflection(x_arr, results, geometry, material_properties):
 
     return theta_y, theta_z, delta_y, delta_z
 
-
 def compute_stress(x_arr, results, geometry):
     sigma = np.zeros(len(x_arr))
     tau   = np.zeros(len(x_arr))
@@ -406,7 +412,6 @@ def plot_mohrs_circle(critical_idx, x_arr, results, geometry):
     print(f" theta_z = {results['theta_z'][critical_idx]:.6f} rad  (slope about z at critical section)")
     print(f"  delta_z = {results['delta_z'][critical_idx]*1e3:.2f} mm  (deflection at critical section)")
 
-
 def critical_section_heatmap(critical_idx, x_arr, results, geometry):
     x_c = x_arr[critical_idx]
     seg = section_at(x_c, geometry)
@@ -432,7 +437,7 @@ def critical_section_heatmap(critical_idx, x_arr, results, geometry):
         np.nan
     )
 
-    # torsional shear stress magnitude at each point
+    # signed torsional shear stress at each point
     r   = np.sqrt(Y**2 + Z**2)
     tau = np.where(mask, T * r / J, np.nan)
 
@@ -482,6 +487,16 @@ def validate_global_equilibrium(all_loads, atol=1e-6):
 
     return residuals
 
+def required_diameter_msst(M, T, Sy, n):
+    """
+    M  = resultant bending moment at section (N·m)
+    T  = torque at section (N·m)
+    Sy = yield strength (Pa)
+    n  = desired factor of safety
+    """
+    return ((32 * n / (np.pi * Sy)) * np.sqrt(M**2 + T**2)) ** (1/3)
+
+
 if __name__ == "__main__":
 
     prepare_geometry(geometry)
@@ -503,6 +518,8 @@ if __name__ == "__main__":
     print(f"Maximum bending moment M_y = {results['M_y'][My_max_idx]:.2f} N·m at x = {x_arr[My_max_idx]:.4f} m")
     M_total_max_idx = np.argmax(np.sqrt(results["M_y"]**2 + results["M_z"]**2))
     print(f"Maximum resultant bending moment M_total = {np.sqrt(results['M_y'][M_total_max_idx]**2 + results['M_z'][M_total_max_idx]**2):.2f} N·m at x = {x_arr[M_total_max_idx]:.4f} m")
+    T_max_idx = np.argmax(np.abs(results["T"]))
+    print(f"Maximum internal torque T = {results['T'][T_max_idx]:.2f} N·m at x = {x_arr[T_max_idx]:.4f} m")
 
     theta_y, theta_z, delta_y, delta_z = compute_deflection(x_arr, results, geometry, material_properties)
     results["theta_y"] = theta_y
@@ -513,13 +530,24 @@ if __name__ == "__main__":
     #stress recovery along beam centerline
     sigma, tau, sigma_vm = compute_stress(x_arr, results, geometry)
 
+    Sy = 200e6 # yield strength (Pa)
+    n = 2 # target factor of safety
+    tau_msst = np.sqrt((sigma / 2)**2 + tau**2)
+    fos_msst = np.divide(
+        Sy,
+        2 * tau_msst,
+        out=np.full_like(tau_msst, np.inf),
+        where=tau_msst > 0,
+    )
+
     #find critical section
-    critical_idx = np.argmax(sigma_vm)
+    critical_idx = np.argmin(fos_msst)
     critical_x   = x_arr[critical_idx]
-    print(f"Critical section at x = {critical_x:.4f} m")
+    print(f"Critical section by current geometry MSST/Tresca FOS at x = {critical_x:.4f} m")
     print(f"  sigma_vm = {sigma_vm[critical_idx]/1e6:.2f} MPa")
     print(f"  sigma    = {sigma[critical_idx]/1e6:.2f} MPa")
     print(f"  tau      = {tau[critical_idx]/1e6:.2f} MPa")
+    print(f"  FOS      = {fos_msst[critical_idx]:.2f}")
     print(f"  M_y      = {results['M_y'][critical_idx]:.2f} N·m")
     print(f"  M_z      = {results['M_z'][critical_idx]:.2f} N·m")
     M_total = np.sqrt(results["M_y"][critical_idx]**2 + results["M_z"][critical_idx]**2)
@@ -540,11 +568,54 @@ if __name__ == "__main__":
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle(f"Critical section at x = {critical_x:.4f} m")
 
-    Sy = 200e6 # yield strength (Pa)
-    tau_max = np.nanmax(tau_cs)
-    factor_of_safety = Sy / (2 * tau_max)
-    print(f"Estimated factor of safety against yielding (using max shear): {factor_of_safety:.2f}")
+    tau_torsion_max = np.nanmax(np.abs(tau_cs))
+    tau_msst_max = np.nanmax(np.sqrt((sigma_cs / 2)**2 + tau_cs**2))
+    factor_of_safety = Sy / (2 * tau_msst_max)
+    print(f"Max torsional shear at section: {tau_torsion_max/1e6:.2f} MPa")
+    print(f"Max shear for yielding (MSST/Tresca): {tau_msst_max/1e6:.2f} MPa")
+    print(f"Estimated factor of safety against yielding (MSST/Tresca): {factor_of_safety:.2f}")
 
+    d_required = np.zeros(len(x_arr))
+    for i, x in enumerate(x_arr):
+        M = np.sqrt(results["M_y"][i]**2 + results["M_z"][i]**2)
+        T = results["T"][i]
+        d_required[i] = required_diameter_msst(M, T, Sy, n)
+
+    d_critical = np.max(d_required)
+    required_diameter_idx = np.argmax(d_required)
+    required_diameter_x = x_arr[required_diameter_idx]
+    print(f"Required diameter for FOS = {n} (MSST/Tresca): {d_critical*1e3:.2f} mm at x = {required_diameter_x:.4f} m")
+    print(f"  Current diameter at required-diameter section = {section_at(required_diameter_x, geometry)['diameter']*1e3:.2f} mm")
+    print(f"  Current FOS at required-diameter section = {fos_msst[required_diameter_idx]:.2f}")
+    print(f"  T at required-diameter section = {results['T'][required_diameter_idx]:.2f} N·m")
+
+    print(f"\nDiameter recommendations for FOS < {n}:")
+    recommendation_found = False
+    for seg in geometry:
+        in_segment = (seg["start"] <= x_arr) & (x_arr <= seg["end"])
+        below_target = in_segment & (fos_msst < n)
+
+        if not np.any(below_target):
+            continue
+
+        recommendation_found = True
+        segment_idxs = np.flatnonzero(below_target)
+        worst_idx = segment_idxs[np.argmin(fos_msst[segment_idxs])]
+        required_idx = segment_idxs[np.argmax(d_required[segment_idxs])]
+        current_diameter = seg["diameter"]
+        recommended_diameter = d_required[required_idx]
+        increase = recommended_diameter - current_diameter
+
+        print(
+            f"  x={x_arr[segment_idxs[0]]:.4f}-{x_arr[segment_idxs[-1]]:.4f} m: "
+            f"current d={current_diameter*1e3:.2f} mm, "
+            f"recommend d>={recommended_diameter*1e3:.2f} mm "
+            f"(increase {increase*1e3:.2f} mm), "
+            f"worst FOS={fos_msst[worst_idx]:.2f} at x={x_arr[worst_idx]:.4f} m"
+        )
+
+    if not recommendation_found:
+        print(f"  All sections meet FOS >= {n}.")
 
     for ax, data, title in zip(
         axes,

@@ -114,7 +114,7 @@ def night_data_route(date_str):
 @app.route('/calendar')
 def calendar_view():
     return render_template('calendar.html', obs_name=OBS_NAME,
-                           current_year=datetime.now().year)
+                           currentYear=datetime.now().year)
 
 
 @app.route('/api/calendar')

@@ -267,9 +267,15 @@
 
     const segments = [];
     let cursor = data.window_start;
-    let state  = 'unknown';
 
-    // Seed initial state from the current roof if available via the first action
+    // Seed initial state from the first recorded row's roof field so the bar
+    // doesn't start as "unknown" before the first action event fires.
+    let state = 'unknown';
+    if (data.rows && data.rows.length > 0) {
+      const firstRoof = (data.rows[0].roof || '').toLowerCase();
+      if (firstRoof === 'open' || firstRoof === 'closed') state = firstRoof;
+    }
+
     for (const a of actions) {
       const ts = new Date(a.timestamp).getTime();
       segments.push({ start: cursor, end: ts, state });
@@ -297,9 +303,26 @@
     const min = key => Math.min(...rows.map(r => r[key]).filter(v => v != null));
     const max = key => Math.max(...rows.map(r => r[key]).filter(v => v != null));
 
-    // Hours roof was open: count rows where roof === 'Open', each row ≈ 20s
-    const openRows = rows.filter(r => (r.roof || '').toLowerCase() === 'open').length;
-    const openHours = (openRows * 20 / 3600).toFixed(1);
+    // Prefer action-timestamp-based open hours (matches roof bar segments).
+    // Falls back to row-counting (×20 s/row) when no action events are available.
+    let openHours;
+    if (data.actions && data.actions.length > 0) {
+      const CLOSE_TYPES = new Set(['close', 'cloud_close', 'rain_close', 'wind_close', 'scheduled_close']);
+      const sorted = [...data.actions].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+      let openStart = null, openMs = 0;
+      for (const a of sorted) {
+        const ts = new Date(a.timestamp).getTime();
+        if (a.action_type === 'open') { openStart = ts; }
+        else if (CLOSE_TYPES.has(a.action_type) && openStart !== null) {
+          openMs += ts - openStart; openStart = null;
+        }
+      }
+      if (openStart !== null) openMs += data.window_end - openStart;
+      openHours = (openMs / 3_600_000).toFixed(1);
+    } else {
+      const openRows = rows.filter(r => (r.roof || '').toLowerCase() === 'open').length;
+      openHours = (openRows * 20 / 3600).toFixed(1);
+    }
 
     const cloudAvg = avg('cloud_approx_pct');
     const tempAvg  = avg('ambient_temp');
@@ -328,7 +351,7 @@
 
     CHART_DEFS.forEach((def, i) => {
       const pts = data.rows
-        .filter(r => r[def.key] != null)
+        .filter(r => r[def.key] != null && r.ts >= data.window_start && r.ts <= data.window_end)
         .map(r => ({ x: r.ts, y: r[def.key] }));
 
       if (charts[def.id]) charts[def.id].destroy();

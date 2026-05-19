@@ -222,6 +222,8 @@
 
   function renderYear(year) {
     document.getElementById('year-label').textContent = year;
+    document.getElementById('btn-prev-year').textContent = `← ${year - 1}`;
+    document.getElementById('btn-next-year').textContent = `${year + 1} →`;
     document.getElementById('btn-prev-year').disabled = year <= thisYear - 5;
     document.getElementById('btn-next-year').disabled = year >= thisYear;
 

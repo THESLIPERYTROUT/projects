@@ -560,7 +560,7 @@
     return ann;
   }
 
-  function makeChart(def, histData, fcData, dailyFcData, annotations, showXAxis) {
+  function makeChart(def, histData, fcData, dailyFcData, annotations, showXAxis, nowTs) {
     const ctx = document.getElementById(`chart-${def.id}`).getContext('2d');
 
     const histPts   = def.histKey
@@ -624,10 +624,12 @@
         scales: {
           x: {
             type: 'time',
+            min: nowTs - 2 * 86_400_000,   // 2 days of history
+            max: nowTs + 7 * 86_400_000,   // 7 days of forecast
             display: showXAxis,
             grid: { color: '#21262d' },
-            ticks: { color: '#8b949e', font: { size: 10 }, maxRotation: 0 },
-            time: { unit: 'hour', displayFormats: { hour: 'MMM d, haaa' } },
+            ticks: { color: '#8b949e', font: { size: 10 }, maxRotation: 0, maxTicksLimit: 10 },
+            time: { unit: 'day', displayFormats: { day: 'MMM d' } },
           },
           y: {
             min: def.yMin ?? undefined,
@@ -665,7 +667,7 @@
 
       const ann = buildAnnotations(data.night_bands, data.now_ts, lastActions);
       CHART_DEFS.forEach((def, i) => {
-        makeChart(def, data.history, data.forecast, data.daily_forecast || [], ann, i === CHART_DEFS.length - 1);
+        makeChart(def, data.history, data.forecast, data.daily_forecast || [], ann, i === CHART_DEFS.length - 1, data.now_ts);
       });
     } catch (e) {
       document.getElementById('chart-loading').style.display = 'none';

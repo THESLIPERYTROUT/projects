@@ -97,15 +97,24 @@ def night_data_route(date_str):
                     data['sunrise_ts'] = data['sunrise_ts'] or st['sunrise_ts']
                     break
 
-    # Compute and persist nightly stats for completed nights
-    compute_and_store_nightly_stats(date_str)
+    # Compute and persist nightly stats for completed nights.
+    # Pass the filtered actions and OWM-enriched sun times so that:
+    #   • hours_open is action-timestamp-accurate (not row-count based)
+    #   • sunset/sunrise survive past the 8-day OWM forecast window
+    compute_and_store_nightly_stats(
+        date_str,
+        actions=data['actions'],
+        sunset_ts=data.get('sunset_ts'),
+        sunrise_ts=data.get('sunrise_ts'),
+    )
 
     return jsonify(data)
 
 
 @app.route('/calendar')
 def calendar_view():
-    return render_template('calendar.html', obs_name=OBS_NAME)
+    return render_template('calendar.html', obs_name=OBS_NAME,
+                           current_year=datetime.now().year)
 
 
 @app.route('/api/calendar')

@@ -1,0 +1,32 @@
+import requests
+import truststore
+from getpass import getpass
+from os import environ
+from requests_pkcs12 import Pkcs12Adapter
+
+username = environ.get("MCMASTER_USERNAME") or input("McMaster username: ")
+password = environ.get("MCMASTER_PASSWORD") or getpass("McMaster password: ")
+cert_path = environ.get("MCMASTER_CERT_PATH") or input("Path to McMaster .pfx/.p12 cert: ")
+cert_password = environ.get("MCMASTER_CERT_PASSWORD") or getpass("McMaster cert password: ")
+
+post_url = "https://api.mcmaster.com/v1/login"
+
+truststore.inject_into_ssl()
+
+login_payload = {
+    "UserName": username,
+    "Password": password
+}
+
+
+session = requests.Session()
+session.trust_env = False
+session.mount(
+    "https://",
+    Pkcs12Adapter(pkcs12_filename=cert_path, pkcs12_password=cert_password),
+)
+
+response = session.post(post_url, json=login_payload, timeout=30)
+
+print(response.status_code)
+print(response.text)

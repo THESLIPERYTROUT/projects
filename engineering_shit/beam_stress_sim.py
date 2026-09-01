@@ -3,7 +3,7 @@ import numpy as np
 
 #Units: SI (m, N, N·m, Pa)
 
-length = 1.08
+length = 1.05
 mesh_density_factor = 0.0025
 simulated_points = int(length / mesh_density_factor)
 
@@ -22,28 +22,25 @@ material_properties = {
 # Segments must be contiguous and together span the full beam length.
 #TODO Make inclusive to non-circular geometery
 geometry = [
-    {"start": 0.00, "end": 0.03, "diameter": 0.03},
-    {"start": 0.03, "end": 0.385, "diameter": 0.04},
-    {"start": 0.385, "end": 0.425, "diameter": 0.05},
-    {"start": 0.425, "end": 0.755, "diameter": 0.075},
-    {"start": 0.755, "end": 0.795, "diameter": 0.05},
-    {"start": 0.795, "end": 1.05, "diameter": 0.042},
-    {"start": 1.05, "end": 1.08, "diameter": 0.03}
+    {"start": 0.00, "end": 1.05, "diameter": 0.075}
 ]
 
 loads = [
     {
-        "type": "point_load",
-        "position": 0.415,
-        "force":  (0, -3760, 10340),
-        "moment": (-3100, 0, 0),
+        "type": "driving gear",
+        "position": 0.400,
+        "diameter": 0.6,  # m
+        "power":  100,  # W
+        "speed": 250,  # RPM
+         #"step_down": 1.0,  # gear ratio
+        "tooth_angle": 25,  # degrees
     },
     {
-        "type": "point_load",
-        "position": 0.765,
-        "force":  (0, -9640, -20660),
-        "moment": (3100, 0, 0),
-    },
+        "type": "driven gear",
+        "position": 0.700,
+        "diameter": 0.3,  # m
+        "tooth_angle": 20,  # degrees
+    }
 ]
 
 def prepare_geometry(geometry):
@@ -83,6 +80,31 @@ def build_load_list(loads, supports):
 
     all_loads = loads.copy()
 
+    driving_gear = next((load for load in all_loads if load["type"] == "driving gear"), None)
+
+    for load in all_loads:
+        if load["type"] in ("driving gear", "driven gear"):
+            if driving_gear is None:
+                raise ValueError("A 'driven gear' load requires a 'driving gear' load to supply shaft power/speed.")
+
+            P = driving_gear["power"]
+            N = driving_gear["speed"]
+            d = load["diameter"] * 1000
+
+            Wt = (60000 * P) / (d * np.pi * N)
+            Wn = Wt / np.tan(np.radians(load["tooth_angle"]))
+            load["force"] = (0, Wn, Wt)
+
+            T = (d / 2) * Wt
+           
+            load["moment"] = (T, 0, 0) if load["type"] == "driving gear" else (-T, 0, 0)
+        elif load["type"] == "point load":
+            pass
+        elif load["type"] == "point moment":
+            pass
+        else:
+            raise NotImplementedError(f"Load type '{load['type']}' not implemented")
+
     statics_solver_matrix = []
     unknowns = []
 
@@ -121,12 +143,12 @@ def build_load_list(loads, supports):
     A = np.array(statics_solver_matrix).T  # (6, n_unknowns)
 
     b = np.array([
-        -sum(load["force"][0]  for load in loads),   # ΣFx
-        -sum(load["force"][1]  for load in loads),   # ΣFy
-        -sum(load["force"][2]  for load in loads),   # ΣFz
-        -sum(load["moment"][0] for load in loads),   # ΣMx
-        -sum(load["moment"][1] - load["force"][2] * load["position"] for load in loads),  # ΣMy
-        -sum(load["moment"][2] + load["force"][1] * load["position"] for load in loads),  # ΣMz
+        -sum(load["force"][0]  for load in all_loads),   # ΣFx
+        -sum(load["force"][1]  for load in all_loads),   # ΣFy
+        -sum(load["force"][2]  for load in all_loads),   # ΣFz
+        -sum(load["moment"][0] for load in all_loads),   # ΣMx
+        -sum(load["moment"][1] - load["force"][2] * load["position"] for load in all_loads),  # ΣMy
+        -sum(load["moment"][2] + load["force"][1] * load["position"] for load in all_loads),  # ΣMz
     ])
 
     '''print("\n--- Solver Debug ---")

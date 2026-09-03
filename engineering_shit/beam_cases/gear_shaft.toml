@@ -1,0 +1,55 @@
+# Beam stress sim case file
+# Run with:  python beam_stress_sim.py beam_cases/gear_shaft.toml
+#
+# Units are SI unless a field takes an explicit *_unit setting (currently only
+# gear power). Positions are measured from the left end of the beam.
+
+[beam]
+length = 1.05                  # m
+mesh_density_factor = 0.0025   # m, spacing between simulated points
+
+[material]
+young_modulus = 200e9          # Pa
+poisson_ratio = 0.3            # dimensionless
+density = 7850                 # kg/m^3
+yield_strength = 200e6         # Pa
+
+[design]
+target_factor_of_safety = 2    # dimensionless, used for required-diameter / recommendation output
+
+# Supports. type = "bearing" (reacts Fy, Fz) or "fixed" (reacts Fx, Fy, Fz, Mx).
+[[supports]]
+position = 0.015               # m
+type = "bearing"
+
+[[supports]]
+position = 1.035               # m  (length - 0.015)
+type = "bearing"
+
+# Geometry segments. Must be contiguous, start at 0 and end at beam length.
+# TODO: non-circular sections not supported yet.
+[[geometry]]
+start = 0.00                   # m
+end = 1.05                     # m
+diameter = 0.075               # m
+
+# Loads. Supported types:
+#   "driving gear" - position (m), diameter (m), power, power_unit, speed (RPM), tooth_angle (deg)
+#                    power_unit is one of "W", "kW", "MW", "hp" (imperial), "PS" (metric). Default "W".
+#   "driven gear"  - position (m), diameter (m), tooth_angle (deg); takes power/speed from the driving gear
+#   "point load"   - position (m), force = [Fx, Fy, Fz]   # N
+#   "point moment" - position (m), moment = [Mx, My, Mz]  # N·m
+[[loads]]
+type = "driving gear"
+position = 0.400               # m
+diameter = 0.6                 # m
+power = 100                    # in power_unit
+power_unit = "W"
+speed = 250                    # RPM
+tooth_angle = 25               # deg
+
+[[loads]]
+type = "driven gear"
+position = 0.700               # m
+diameter = 0.3                 # m
+tooth_angle = 20               # deg

@@ -2,8 +2,11 @@
 # Run with:  python beam_stress_sim.py beam_cases/gear_shaft.toml
 # Units: SI (m, N, N·m, Pa). Positions are measured from the left end of the beam.
 
+[units]
+system = "SI"                # Imperial: in, lbf, lbf*in, psi, lbm/in^3, hp
+
 [beam]
-length = 0.2
+length = 0.8
 mesh_density_factor = 0.0025   # spacing between simulated points (m)
 
 [material]
@@ -25,8 +28,8 @@ type = "fixed"
 # TODO: non-circular sections not supported yet.
 [[geometry]]
 start = 0.00
-end = 0.2
-diameter = 0.075
+end = 0.8
+diameter = 1
 
 # Loads. Supported types:
 #   "driving gear" - position, diameter, power (W), speed (RPM), tooth_angle (deg)
@@ -36,13 +39,17 @@ diameter = 0.075
 
 [[loads]]
 type = "point load"
-position = 0.2                 # m
-force = [0, 50, 0]             # N
+position = 0.8               # m
+force = [314.15, 157.07, -94.247]             # N
 
-# 50 N hanging 50 mm off the bar axis -> 2.5 N·m torque about x.
-# Use [0, 0, 2.5] instead if the moment bends the bar (about z) rather than twisting it.
 [[loads]]
 type = "point moment"
-position = 0.2                 # m
-moment = [2.5, 0, 0]           # N·m
+position = 0.8               # m
+moment = [94.247, 0, 0]          # N·m
+
+[[loads]]
+type = "point moment"
+position = 0.0              # m
+moment = [0, 314.15, 0]          # N·m
+
 

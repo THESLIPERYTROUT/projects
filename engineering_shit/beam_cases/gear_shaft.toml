@@ -1,55 +1,78 @@
 # Beam stress sim case file
 # Run with:  python beam_stress_sim.py beam_cases/gear_shaft.toml
 #
-# Units are SI unless a field takes an explicit *_unit setting (currently only
-# gear power). Positions are measured from the left end of the beam.
+# Positions are measured from the left end of the beam.
+# SI inputs: m, N, N*m, Pa, kg/m^3, W.
+# Imperial inputs: in, lbf, lbf*in, psi, lbm/in^3, hp.
+# The system applies to ALL dimensional inputs, including mesh spacing and
+# gear diameters. Changing the setting requires converting the numbers too.
+# Speed is always RPM; tooth angles are degrees; ratios are dimensionless.
+# An explicit power_unit overrides the system's power default.
+# Reports and plots follow the selected system (SI stresses in MPa, diameters and
+# deflections in mm; Imperial: in, lbf, lbf*in, psi, hp).
+
+[units]
+system = "Imperial"                 # "SI" (default when omitted) or "Imperial"
 
 [beam]
-length = 1.05                  # m
-mesh_density_factor = 0.0025   # m, spacing between simulated points
+length = 9.0                  
+mesh_density_factor = 0.0025   
 
 [material]
-young_modulus = 200e9          # Pa
-poisson_ratio = 0.3            # dimensionless
-density = 7850                 # kg/m^3
-yield_strength = 200e6         # Pa
+# Original steel assumptions converted to Imperial units (no specific grade).
+young_modulus = 29.0075e6      # psi, approximately 200 GPa
+poisson_ratio = 0.3           # dimensionless
+density = 0.283599            # lbm/in^3, approximately 7850 kg/m^3
+yield_strength = 29.0075e3    # psi, approximately 200 MPa
 
 [design]
 target_factor_of_safety = 2    # dimensionless, used for required-diameter / recommendation output
 
 # Supports. type = "bearing" (reacts Fy, Fz) or "fixed" (reacts Fx, Fy, Fz, Mx).
 [[supports]]
-position = 0.015               # m
+position = 0.0           
 type = "bearing"
 
 [[supports]]
-position = 1.035               # m  (length - 0.015)
+position = 9.0           
 type = "bearing"
 
 # Geometry segments. Must be contiguous, start at 0 and end at beam length.
 # TODO: non-circular sections not supported yet.
 [[geometry]]
-start = 0.00                   # m
-end = 1.05                     # m
-diameter = 0.075               # m
+start = 0.00              
+end = 9.0                   
+diameter = 0.5       
 
 # Loads. Supported types:
-#   "driving gear" - position (m), diameter (m), power, power_unit, speed (RPM), tooth_angle (deg)
-#                    power_unit is one of "W", "kW", "MW", "hp" (imperial), "PS" (metric). Default "W".
-#   "driven gear"  - position (m), diameter (m), tooth_angle (deg); takes power/speed from the driving gear
-#   "point load"   - position (m), force = [Fx, Fy, Fz]   # N
-#   "point moment" - position (m), moment = [Mx, My, Mz]  # N·m
+#   "driving gear" - position, diameter, power, power_unit, speed (RPM), tooth_angle (deg)
+#                    power_unit: "W", "kW", "MW", "hp" (imperial), "PS" (metric).
+#                    Defaults to "W" for SI, "hp" for Imperial.
+#   "driven gear"  - position, diameter, tooth_angle (deg); takes power/speed from the driving gear
+#   "point load"   - position, force = [Fx, Fy, Fz]
+#   "point moment" - position, moment = [Mx, My, Mz]
+# Positions, diameters, forces and moments use the selected system above.
+# Both gear types require "meshing orientation": the mating external gear's
+# location relative to this shaft, viewed from the +x end toward the origin
+# with +y up: top = +y, bottom = -y, left = +z, right = -z.
+# tooth_angle is the spur-gear pressure angle in degrees; diameter is pitch diameter.
+# Torque convention: driving gear applies +Mx; driven gear applies -Mx.
+# Speed is a positive RPM magnitude. Radial force pushes away from the mate;
+# tangential force follows the torque sign. These gears are on the same shaft,
+# each meshing with a separate external gear, not directly with each other.
+
 [[loads]]
 type = "driving gear"
-position = 0.400               # m
-diameter = 0.6                 # m
-power = 100                    # in power_unit
-power_unit = "W"
-speed = 250                    # RPM
-tooth_angle = 25               # deg
+"meshing orientation" = "right"  
+position = 1.5             
+diameter = 12               
+power = 20            
+speed = 389.375                  
+tooth_angle = 20            
 
 [[loads]]
 type = "driven gear"
-position = 0.700               # m
-diameter = 0.3                 # m
-tooth_angle = 20               # deg
+"meshing orientation" = "right"  
+position = 7.25          
+diameter = 2.67                
+tooth_angle = 25            

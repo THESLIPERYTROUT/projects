@@ -5,7 +5,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-#Units: SI (m, N, N·m, Pa)
+# Inputs: [units] system = "SI" (default) or "Imperial" in the case file.
+# Solver uses SI internally; reports and plots follow the selected unit system.
 #
 # All case settings (beam, material, supports, geometry, loads) live in a TOML
 # case file so different sim cases can be saved independently of this program.
@@ -26,47 +27,84 @@ POWER_UNITS = {
     "PS": 735.49875,   # metric horsepower
 }
 
+# Multipliers from case input units to SI. Imperial density is mass density,
+# in lbm/in^3, not weight density. Angles (deg), speed (RPM), Poisson's ratio
+# and factor of safety have the same conventions in both systems.
+INCH_TO_M = 0.0254
+LBM_TO_KG = 0.45359237
+LBF_TO_N = LBM_TO_KG * 9.80665
+# Unit vectors from the modeled shaft toward the mating external spur gear.
+# +x runs along the shaft. Viewed from the +x end toward the origin, with
+# +y up, +z points left: top = +y, bottom = -y, left = +z, right = -z.
+MESH_DIRECTIONS = {
+    "top": (1.0, 0.0), "right": (0.0, -1.0),
+    "bottom": (-1.0, 0.0), "left": (0.0, 1.0),
+}
+INPUT_UNITS = {
+    "SI": {
+        "length": 1.0, "force": 1.0, "moment": 1.0,
+        "stress": 1.0, "density": 1.0, "power_unit": "W",
+    },
+    "Imperial": {
+        "length": INCH_TO_M,
+        "force": LBF_TO_N,
+        "moment": LBF_TO_N * INCH_TO_M,
+        "stress": LBF_TO_N / INCH_TO_M**2,
+        "density": LBM_TO_KG / INCH_TO_M**3,
+        "power_unit": "hp",
+    },
+}
+
 def _require(table, key, section):
     if key not in table:
         raise KeyError(f"Config section [{section}] is missing required key '{key}'")
     return table[key]
 
 def load_case(path):
-    """Read a TOML case file and return a validated settings dict."""
+    """Read a TOML case file, convert all dimensional inputs to SI, and validate."""
     path = Path(path)
     with open(path, "rb") as f:
         raw = tomllib.load(f)
+
+    units_config = raw.get("units", {})
+    if not isinstance(units_config, dict):
+        raise ValueError('Use [units] with system = "SI" or "Imperial"')
+    system_input = str(units_config.get("system", "SI")).strip().casefold()
+    unit_system = {"si": "SI", "imperial": "Imperial"}.get(system_input)
+    if unit_system is None:
+        raise ValueError('[units] system must be "SI" or "Imperial"')
+    units = INPUT_UNITS[unit_system]
 
     for section in ("beam", "material", "supports", "geometry", "loads"):
         if section not in raw:
             raise KeyError(f"Config file {path} is missing required section [{section}]")
 
     beam = raw["beam"]
-    length = float(_require(beam, "length", "beam"))
-    mesh_density_factor = float(_require(beam, "mesh_density_factor", "beam"))
+    length = float(_require(beam, "length", "beam")) * units["length"]
+    mesh_density_factor = float(_require(beam, "mesh_density_factor", "beam")) * units["length"]
     if length <= 0 or mesh_density_factor <= 0:
         raise ValueError("[beam] length and mesh_density_factor must be positive")
 
     material = raw["material"]
     material_properties = {
-        "young_modulus": float(_require(material, "young_modulus", "material")),
+        "young_modulus": float(_require(material, "young_modulus", "material")) * units["stress"],
         "poisson_ratio": float(material.get("poisson_ratio", 0.3)),
-        "density":       float(material.get("density", 7850)),
+        "density":       float(material["density"]) * units["density"] if "density" in material else 7850.0,
     }
-    yield_strength = float(_require(material, "yield_strength", "material"))
+    yield_strength = float(_require(material, "yield_strength", "material")) * units["stress"]
 
     design = raw.get("design", {})
     target_fos = design.get("target_factor_of_safety", 2)
 
     supports = [dict(s) for s in raw["supports"]]
     for s in supports:
-        _require(s, "position", "supports")
+        s["position"] = float(_require(s, "position", "supports")) * units["length"]
         _require(s, "type", "supports")
 
     geometry = sorted((dict(g) for g in raw["geometry"]), key=lambda g: g["start"])
     for g in geometry:
         for key in ("start", "end", "diameter"):
-            _require(g, key, "geometry")
+            g[key] = float(_require(g, key, "geometry")) * units["length"]
     if not np.isclose(geometry[0]["start"], 0.0):
         raise ValueError("First [[geometry]] segment must start at 0")
     if not np.isclose(geometry[-1]["end"], length):
@@ -79,9 +117,20 @@ def load_case(path):
     for raw_load in raw["loads"]:
         load = dict(raw_load)
         _require(load, "type", "loads")
-        _require(load, "position", "loads")
+        load["position"] = float(_require(load, "position", "loads")) * units["length"]
+        if load["type"] in ("driving gear", "driven gear"):
+            load["diameter"] = float(_require(load, "diameter", "loads")) * units["length"]
+            orientation = str(_require(load, "meshing orientation", "loads")).strip().casefold()
+            if orientation not in MESH_DIRECTIONS:
+                raise ValueError("[loads] meshing orientation must be top, right, bottom, or left")
+            load["meshing orientation"] = orientation
+            load["tooth_angle"] = float(_require(load, "tooth_angle", "loads"))
+            if not np.isfinite(load["diameter"]) or load["diameter"] <= 0:
+                raise ValueError("[loads] gear diameter must be positive and finite")
+            if not 0 < load["tooth_angle"] < 90:
+                raise ValueError("[loads] tooth_angle is the pressure angle and must be between 0 and 90 degrees")
         if load["type"] == "driving gear":
-            unit = str(load.get("power_unit", "W"))
+            unit = str(load.get("power_unit", units["power_unit"]))
             if unit not in POWER_UNITS:
                 raise ValueError(
                     f"Load at x={load['position']}: unknown power_unit '{unit}' "
@@ -90,9 +139,14 @@ def load_case(path):
             load["power_unit"] = unit
             load["power_input"] = float(_require(load, "power", "loads"))  # as written in the case file
             load["power"] = load["power_input"] * POWER_UNITS[unit]        # solver works in W
+            load["speed"] = float(_require(load, "speed", "loads"))
+            if not np.isfinite(load["power"]) or load["power"] < 0:
+                raise ValueError("[loads] gear power must be nonnegative and finite")
+            if not np.isfinite(load["speed"]) or load["speed"] <= 0:
+                raise ValueError("[loads] gear speed must be positive and finite (RPM magnitude)")
         # TOML arrays come in as lists; the solver expects (Fx, Fy, Fz) / (Mx, My, Mz) tuples
-        load["force"]  = tuple(float(v) for v in load.get("force",  (0, 0, 0)))
-        load["moment"] = tuple(float(v) for v in load.get("moment", (0, 0, 0)))
+        load["force"]  = tuple(float(v) * units["force"] for v in load.get("force",  (0, 0, 0)))
+        load["moment"] = tuple(float(v) * units["moment"] for v in load.get("moment", (0, 0, 0)))
         if len(load["force"]) != 3 or len(load["moment"]) != 3:
             raise ValueError(f"Load at x={load['position']}: force/moment must have 3 components")
         loads.append(load)
@@ -103,6 +157,7 @@ def load_case(path):
 
     return {
         "case_path": path,
+        "unit_system": unit_system,
         "length": length,
         "mesh_density_factor": mesh_density_factor,
         "simulated_points": int(length / mesh_density_factor),
@@ -161,15 +216,20 @@ def build_load_list(loads, supports):
 
             P = driving_gear["power"]
             N = driving_gear["speed"]
-            d = load["diameter"] * 1000
+            d = load["diameter"]  # meters, matching the rest of the solver
 
-            Wt = (60000 * P) / (d * np.pi * N)
-            Wn = Wt / np.tan(np.radians(load["tooth_angle"]))
-            load["force"] = (0, Wn, Wt)
-
-            T = (d / 2) * Wt
-           
-            load["moment"] = (T, 0, 0) if load["type"] == "driving gear" else (-T, 0, 0)
+            Wt = (60 * P) / (d * np.pi * N)
+            Wr = Wt * np.tan(np.radians(load["tooth_angle"]))
+            ny, nz = MESH_DIRECTIONS[load["meshing orientation"]]
+            # Preserve the solver's torque convention: driving gear adds +Mx,
+            # driven gear removes it (-Mx). For an external mesh the radial
+            # force is -Wr*n, and the +Mx tangential direction is x_hat cross n.
+            sign = 1 if load["type"] == "driving gear" else -1
+            load["force"] = (0, -Wr * ny - sign * Wt * nz,
+                                -Wr * nz + sign * Wt * ny)
+            # Transfer the contact force to the shaft centerline with its
+            # equivalent couple: Mx = r_y*Fz - r_z*Fy = sign * radius * Wt.
+            load["moment"] = (sign * (d / 2) * Wt, 0, 0)
         elif load["type"] == "point load":
             pass
         elif load["type"] == "point moment":
@@ -226,19 +286,6 @@ def build_load_list(loads, supports):
         -sum(load["moment"][1] - load["force"][2] * load["position"] for load in all_loads),  # ΣMy
         -sum(load["moment"][2] + load["force"][1] * load["position"] for load in all_loads),  # ΣMz
     ])
-
-    '''print("\n--- Solver Debug ---")
-    print(f"\nA matrix (6 x {A.shape[1]}):")
-    print(A)
-    print(f"\nb vector:")
-    labels = ["ΣFx", "ΣFy", "ΣFz", "ΣMx", "ΣMy", "ΣMz"]
-    for label, val in zip(labels, b):
-        print(f"  {label} = {val:.4f}")
-    print(f"\nUnknowns: {[u['dof']+'@'+str(u['position']) for u in unknowns]}")
-
-    reactions, _, rank, _ = np.linalg.lstsq(A, b, rcond=None)
-    print(f"\nSolved reactions: {reactions}")
-    print(f"\nResidual A@x - b: {A @ reactions - b}")'''
 
     reactions, residuals, rank, _ = np.linalg.lstsq(A, b, rcond=None)
 
@@ -379,10 +426,21 @@ def compute_stress(x_arr, results, geometry):
 
 def plot_beam_preview(case):
     """Draw a to-scale side view of the beam: segments, supports and loads."""
-    length   = case["length"]
-    geometry = case["geometry"]
-    supports = case["supports"]
-    loads    = case["loads"]
+    units = ReportUnits(case["unit_system"])
+    scale = units.scales["length"]
+    length = case["length"] / scale
+    # Display copies keep all solver geometry and loads in SI.
+    geometry = [{key: seg[key] / scale for key in ("start", "end", "diameter")}
+                for seg in case["geometry"]]
+    supports = [dict(support, position=support["position"] / scale) for support in case["supports"]]
+    loads = []
+    for source in case["loads"]:
+        load = dict(source, position=source["position"] / scale)
+        if "diameter" in load:
+            load["diameter"] /= scale
+        for quantity in ("force", "moment"):
+            load[quantity] = tuple(value / units.scales[quantity] for value in source[quantity])
+        loads.append(load)
 
     d_max = max(seg["diameter"] for seg in geometry)
     gear_max = max((l["diameter"] for l in loads if l["type"] in ("driving gear", "driven gear")), default=0.0)
@@ -395,7 +453,7 @@ def plot_beam_preview(case):
         d = seg["diameter"]
         ax.add_patch(plt.Rectangle((seg["start"], -d / 2), seg["end"] - seg["start"], d,
                                    facecolor="lightgray", edgecolor="black", linewidth=1.2, zorder=2))
-        ax.text((seg["start"] + seg["end"]) / 2, 0, f"d = {d*1e3:.1f} mm",
+        ax.text((seg["start"] + seg["end"]) / 2, 0, f"d = {units.number(d * scale, 'diameter')} {units.labels['diameter']}",
                 ha="center", va="center", fontsize=8, zorder=5)
     ax.axhline(0, color="black", linewidth=0.6, linestyle="-.", zorder=1)
 
@@ -408,12 +466,12 @@ def plot_beam_preview(case):
         if s["type"] == "bearing":
             ax.add_patch(plt.Polygon([[x, y0], [x - tri_w, y0 - tri_h], [x + tri_w, y0 - tri_h]],
                                      closed=True, facecolor="white", edgecolor="black", linewidth=1.2, zorder=3))
-            ax.text(x, y0 - tri_h * 1.15, f"bearing\nx = {x:.3f} m", ha="center", va="top", fontsize=8)
+            ax.text(x, y0 - tri_h * 1.15, f"bearing\nx = {format_number(x)} {units.labels['length']}", ha="center", va="top", fontsize=8)
         else:
             wall_w = 0.02 * length
             ax.add_patch(plt.Rectangle((x - wall_w / 2, -y_extent), wall_w, 2 * y_extent,
                                        facecolor="none", edgecolor="black", hatch="////", linewidth=1.2, zorder=3))
-            ax.text(x, -y_extent * 1.05, f"{s['type']}\nx = {x:.3f} m", ha="center", va="top", fontsize=8)
+            ax.text(x, -y_extent * 1.05, f"{s['type']}\nx = {format_number(x)} {units.labels['length']}", ha="center", va="top", fontsize=8)
 
     # loads
     arrow_len = 0.6 * y_extent if y_extent > 0 else 0.1 * length
@@ -425,9 +483,9 @@ def plot_beam_preview(case):
             color = "steelblue" if l["type"] == "driving gear" else "darkorange"
             ax.add_patch(plt.Circle((x, 0), r, facecolor=color, alpha=0.15, edgecolor=color,
                                     linewidth=1.5, linestyle="--", zorder=1))
-            label = f"{l['type']}\nD = {l['diameter']*1e3:.0f} mm, {l['tooth_angle']:g}°"
+            label = f"{l['type']}\nD = {units.number(l['diameter'] * scale, 'diameter')} {units.labels['diameter']}, {l['tooth_angle']:g}°"
             if l["type"] == "driving gear":
-                label += f"\n{l['power_input']:g} {l['power_unit']} @ {l['speed']:g} RPM"
+                label += f"\n{units.number(l['power'], 'power')} {units.labels['power']} @ {l['speed']:g} RPM"
             ax.text(x, r + 0.04 * y_extent, label, ha="center", va="bottom", fontsize=8, color=color, zorder=5)
         elif l["type"] == "point load":
             Fx, Fy, Fz = l["force"]
@@ -437,24 +495,24 @@ def plot_beam_preview(case):
             if F > 0:
                 ax.annotate("", xy=(x, tail * r_shaft), xytext=(x, tail * (r_shaft + arrow_len)),
                             arrowprops=dict(arrowstyle="-|>", color="red", lw=1.8), zorder=4)
-            ax.text(x, tail * (r_shaft + arrow_len * 1.1), f"point load\nF = ({Fx:g}, {Fy:g}, {Fz:g}) N",
+            ax.text(x, tail * (r_shaft + arrow_len * 1.1), f"point load\nF = ({format_number(Fx)}, {format_number(Fy)}, {format_number(Fz)}) {units.labels['force']}",
                     ha="center", va="bottom" if tail > 0 else "top", fontsize=8, color="red", zorder=5)
         elif l["type"] == "point moment":
             Mx, My, Mz = l["moment"]
             ax.plot(x, r_shaft, marker="o", markersize=9, markerfacecolor="none", markeredgecolor="purple",
                     markeredgewidth=1.8, zorder=4)
-            ax.text(x, r_shaft + 0.15 * y_extent, f"point moment\nM = ({Mx:g}, {My:g}, {Mz:g}) N·m",
+            ax.text(x, r_shaft + 0.15 * y_extent, f"point moment\nM = ({format_number(Mx)}, {format_number(My)}, {format_number(Mz)}) {units.labels['moment']}",
                     ha="center", va="bottom", fontsize=8, color="purple", zorder=5)
 
     # station marks along the x axis for every support and load
     stations = sorted({s["position"] for s in supports} | {l["position"] for l in loads})
     ax.set_xticks(stations)
-    ax.set_xticklabels([f"{s:.3f}" for s in stations], rotation=45, fontsize=8)
+    ax.set_xticklabels([format_number(s) for s in stations], rotation=45, fontsize=8)
 
     ax.set_xlim(-0.05 * length, 1.05 * length)
     ax.set_ylim(-2.0 * y_extent - tri_h, 2.2 * y_extent)
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("y (m)")
+    ax.set_xlabel(f"x ({units.labels['length']})")
+    ax.set_ylabel(f"y ({units.labels['length']})")
     # slender beams are unreadable at true aspect, so exaggerate y for those
     if length / (2 * y_extent) <= 6:
         ax.set_aspect("equal")
@@ -462,60 +520,59 @@ def plot_beam_preview(case):
     else:
         ax.set_aspect("auto")
         scale_note = "x to scale, y exaggerated"
-    ax.set_title(f"Beam preview - {Path(case['case_path']).name}  (L = {length:.3f} m, {scale_note})")
+    ax.set_title(f"Beam preview - {Path(case['case_path']).name}  (L = {format_number(length)} {units.labels['length']}, {scale_note})")
     ax.grid(True, axis="x", alpha=0.3)
 
     plt.tight_layout()
     plt.show()
 
-def plot_diagrams(x_arr, results, critical_x):
-    fig, axes = plt.subplots(3, 2, figsize=(16, 10))
-
-    load_diagrams = [
-        ("V_y", "Shear V_y (N)",        axes[0, 0]),
-        ("V_z", "Shear V_z (N)",        axes[0, 1]),
-        ("M_y", "Bending M_y (N*m)",    axes[1, 0]),
-        ("M_z", "Bending M_z (N*m)",    axes[1, 1]),
-        ("T",   "Torsion T (N*m)",      axes[2, 0]),
-        ("N",   "Axial N (N)",          axes[2, 1]),
+def plot_diagrams(x_arr, results, critical_x, unit_system="SI"):
+    units = ReportUnits(unit_system)
+    x_plot = x_arr / units.scales["length"]
+    critical_plot = critical_x / units.scales["length"]
+    groups = [
+        ((3, 2), (16, 10), "steelblue", [
+            ("V_y", "Shear V_y", "force"), ("V_z", "Shear V_z", "force"),
+            ("M_y", "Bending M_y", "moment"), ("M_z", "Bending M_z", "moment"),
+            ("T", "Torsion T", "moment"), ("N", "Axial N", "force"),
+        ]),
+        ((2, 2), (14, 8), "darkorange", [
+            ("theta_y", "Slope theta_y", "slope"), ("theta_z", "Slope theta_z", "slope"),
+            ("delta_y", "Deflection delta_y", "deflection"),
+            ("delta_z", "Deflection delta_z", "deflection"),
+        ]),
     ]
+    for shape, size, color, diagrams in groups:
+        fig, axes = plt.subplots(*shape, figsize=size)
+        for ax, (key, title, quantity) in zip(axes.flat, diagrams):
+            values = results[key] / units.scales[quantity]
+            ax.plot(x_plot, values, color=color, linewidth=1.5)
+            ax.axhline(0, color="black", linewidth=0.5, linestyle="--")
+            ax.axvline(critical_plot, color="red", linewidth=1, linestyle="--", label="critical section")
+            ax.fill_between(x_plot, values, alpha=0.15, color=color)
+            ax.set_title(f"{title} ({units.labels[quantity]})")
+            ax.set_xlabel(f"x ({units.labels['length']})")
+            ax.set_ylabel(units.labels[quantity])
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
 
-    for key, title, ax in load_diagrams:
-        ax.plot(x_arr, results[key], color="steelblue", linewidth=1.5)
-        ax.axhline(0, color="black", linewidth=0.5, linestyle="--")
-        ax.axvline(critical_x, color="red", linewidth=1, linestyle="--", label="critical section")
-        ax.fill_between(x_arr, results[key], alpha=0.15, color="steelblue")
-        ax.set_title(title)
-        ax.set_xlabel("x (m)")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
+def principal_stresses(sigma_x, tau_xy):
+    """Plane stress properties, in Pa and degrees, for sigma_y = 0."""
+    center = sigma_x / 2
+    radius = np.hypot(center, tau_xy)
+    return {
+        "center": center,
+        "radius": radius,
+        "sigma_1": center + radius,
+        "sigma_2": center - radius,
+        "theta_p": 0.5 * np.degrees(np.arctan2(tau_xy, center)),
+    }
 
-    plt.tight_layout()
-    plt.show()
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-
-    deflection_diagrams = [
-        ("theta_y", "Slope theta_y (rad)",    axes[0, 0]),
-        ("theta_z", "Slope theta_z (rad)",    axes[0, 1]),
-        ("delta_y", "Deflection delta_y (m)", axes[1, 0]),
-        ("delta_z", "Deflection delta_z (m)", axes[1, 1]),
-    ]
-
-    for key, title, ax in deflection_diagrams:
-        ax.plot(x_arr, results[key], color="darkorange", linewidth=1.5)
-        ax.axhline(0, color="black", linewidth=0.5, linestyle="--")
-        ax.axvline(critical_x, color="red", linewidth=1, linestyle="--", label="critical section")
-        ax.fill_between(x_arr, results[key], alpha=0.15, color="darkorange")
-        ax.set_title(title)
-        ax.set_xlabel("x (m)")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.show()
-
-def plot_mohrs_circle(critical_idx, x_arr, results, geometry):
+def plot_mohrs_circle(critical_idx, x_arr, results, geometry, unit_system="SI"):
+    units = ReportUnits(unit_system)
+    stress_unit = units.labels["stress"]
     x_c = x_arr[critical_idx]
     seg = section_at(x_c, geometry)
     I, J, A, c = seg["I"], seg["J"], seg["A"], seg["c"]
@@ -532,16 +589,11 @@ def plot_mohrs_circle(critical_idx, x_arr, results, geometry):
     sigma_y = 0                               # no transverse normal stress
     tau_xy  = T * c / J                       # torsional shear
 
-    # mohr's circle parameters
-    center = (sigma_x + sigma_y) / 2
-    radius = np.sqrt(((sigma_x - sigma_y) / 2)**2 + tau_xy**2)
-
-    # principal stresses
-    sigma_1 = center + radius
-    sigma_2 = center - radius
-
-    # principal angle
-    theta_p = 0.5 * np.degrees(np.arctan2(tau_xy, (sigma_x - sigma_y) / 2))
+    sigma_x /= units.scales["stress"]
+    tau_xy /= units.scales["stress"]
+    principal = principal_stresses(sigma_x, tau_xy)
+    center, radius = principal["center"], principal["radius"]
+    sigma_1, sigma_2 = principal["sigma_1"], principal["sigma_2"]
 
     # max shear
     tau_max = radius
@@ -559,51 +611,38 @@ def plot_mohrs_circle(critical_idx, x_arr, results, geometry):
     ax.plot(center, 0, "ko", markersize=4)
 
     # current stress state point A (sigma_x, -tau_xy) and B (sigma_y, +tau_xy)
-    ax.plot(sigma_x,  -tau_xy, "o", color="coral",    markersize=8, label=f"Point A  (sigma={sigma_x/1e6:.1f} MPa, tau={-tau_xy/1e6:.1f} MPa)")
-    ax.plot(sigma_y,  +tau_xy, "o", color="steelblue", markersize=8, label=f"Point B  (sigma={sigma_y/1e6:.1f} MPa, tau={+tau_xy/1e6:.1f} MPa)")
+    ax.plot(sigma_x,  -tau_xy, "o", color="coral",    markersize=8, label=f"Point A  (sigma={format_number(sigma_x)} {stress_unit}, tau={format_number(-tau_xy)} {stress_unit})")
+    ax.plot(sigma_y,  +tau_xy, "o", color="steelblue", markersize=8, label=f"Point B  (sigma={format_number(sigma_y)} {stress_unit}, tau={format_number(+tau_xy)} {stress_unit})")
 
     # diameter line A to B
     ax.plot([sigma_x, sigma_y], [-tau_xy, tau_xy],
             color="gray", linewidth=0.8, linestyle="--")
 
     # principal stress points on sigma axis
-    ax.plot(sigma_1, 0, "^", color="red",   markersize=9, label=f"sigma_1 = {sigma_1/1e6:.2f} MPa")
-    ax.plot(sigma_2, 0, "v", color="green", markersize=9, label=f"sigma_2 = {sigma_2/1e6:.2f} MPa")
+    ax.plot(sigma_1, 0, "^", color="red",   markersize=9, label=f"sigma_1 = {format_number(sigma_1)} {stress_unit}")
+    ax.plot(sigma_2, 0, "v", color="green", markersize=9, label=f"sigma_2 = {format_number(sigma_2)} {stress_unit}")
 
     # max shear point
-    ax.plot(center, tau_max, "s", color="purple", markersize=8, label=f"tau_max = {tau_max/1e6:.2f} MPa")
+    ax.plot(center, tau_max, "s", color="purple", markersize=8, label=f"tau_max = {format_number(tau_max)} {stress_unit}")
 
     # reference lines
     ax.axhline(0, color="black", linewidth=0.5)
     ax.axvline(0, color="black", linewidth=0.5)
 
     # annotations
-    ax.annotate(f"C = {center/1e6:.2f} MPa", xy=(center, 0),
+    ax.annotate(f"C = {format_number(center)} {stress_unit}", xy=(center, 0),
                 xytext=(center, radius * 0.15),
                 ha="center", fontsize=9, color="black")
 
-    ax.set_xlabel("Normal stress sigma (Pa)")
-    ax.set_ylabel("Shear stress tau (Pa)")
-    ax.set_title(f"Mohr's circle - critical section x = {x_c:.4f} m  (d = {seg['diameter']*1e3:.1f} mm)")
+    ax.set_xlabel(f"Normal stress sigma ({stress_unit})")
+    ax.set_ylabel(f"Shear stress tau ({stress_unit})")
+    ax.set_title(f"Mohr's circle - critical section x = {units.number(x_c, 'length')} {units.labels['length']}  (d = {units.number(seg['diameter'], 'diameter')} {units.labels['diameter']})")
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8, loc="upper right")
 
     plt.tight_layout()
     plt.show()
-
-    # print summary
-    print(f"\n--- Principal stress summary (x = {x_c:.4f} m) ---")
-    print(f"  sigma_x  = {sigma_x/1e6:.2f} MPa")
-    print(f"  tau_xy   = {tau_xy/1e6:.2f} MPa")
-    print(f"  Center C = {center/1e6:.2f} MPa")
-    print(f"  Radius R = {radius/1e6:.2f} MPa")
-    print(f"  sigma_1  = {sigma_1/1e6:.2f} MPa")
-    print(f"  sigma_2  = {sigma_2/1e6:.2f} MPa")
-    print(f"  tau_max  = {tau_max/1e6:.2f} MPa")
-    print(f"  theta_p  = {theta_p:.2f} deg  (principal angle, 2D convention)")
-    print(f" theta_z = {results['theta_z'][critical_idx]:.6f} rad  (slope about z at critical section)")
-    print(f"  delta_z = {results['delta_z'][critical_idx]*1e3:.2f} mm  (deflection at critical section)")
 
 def critical_section_heatmap(critical_idx, x_arr, results, geometry):
     x_c = x_arr[critical_idx]
@@ -642,28 +681,15 @@ def critical_section_heatmap(critical_idx, x_arr, results, geometry):
 
     return Y, Z, sigma, tau, sigma_vm
 
-def debug_reactions(all_loads, loads):
-    print("\n--- Reaction Debug ---")
-
-    # print applied loads
-    print("\nApplied loads:")
-    for load in loads:
-        print(f"  x={load['position']:.3f}m  F={load['force']}  M={load['moment']}")
-
-    # print solved reactions
-    print("\nSolved reactions:")
-    for load in all_loads:
-        if load["type"] == "reaction":
-            print(f"  x={load['position']:.3f}m  F={load['force']}  M={load['moment']}")
-
-    # verify equilibrium manually
-    print("\nEquilibrium check (should all be ~0):")
-    print(f"  ΣFx = {sum(l['force'][0] for l in all_loads):.4f} N")
-    print(f"  ΣFy = {sum(l['force'][1] for l in all_loads):.4f} N")
-    print(f"  ΣFz = {sum(l['force'][2] for l in all_loads):.4f} N")
-    print(f"  ΣMx = {sum(l['moment'][0] for l in all_loads):.4f} N·m")
-    print(f"  ΣMy = {sum(l['moment'][1] + l['force'][2] * l['position'] for l in all_loads):.4f} N·m")
-    print(f"  ΣMz = {sum(l['moment'][2] + l['force'][1] * l['position'] for l in all_loads):.4f} N·m")
+def debug_reactions(all_loads, loads, unit_system="SI"):
+    units = ReportUnits(unit_system)
+    print_load_table("APPLIED LOADS", loads, units)
+    print_load_table("REACTION COMPONENTS", [l for l in all_loads if l["type"] == "reaction"], units)
+    residuals = validate_global_equilibrium(all_loads)
+    print_table("EQUILIBRIUM RESIDUALS (expected near zero)", ("Quantity", "Value", "Unit"), [
+        units.row(name, value, "force" if name.startswith("sum_f") else "moment")
+        for name, value in residuals.items()
+    ])
 
 def validate_global_equilibrium(all_loads, atol=1e-6):
     residuals = {
@@ -689,158 +715,267 @@ def required_diameter_msst(M, T, Sy, n):
     """
     return ((32 * n / (np.pi * Sy)) * np.sqrt(M**2 + T**2)) ** (1/3)
 
+def format_number(value):
+    """Compact terminal numbers without hiding small, nonzero results."""
+    value = float(value)
+    if np.isnan(value):
+        return "n/a"
+    if np.isinf(value):
+        return "inf" if value > 0 else "-inf"
+    if value == 0:
+        return "0"
+    if abs(value) < 0.01 or abs(value) >= 1e7:
+        return f"{value:.4e}"
+    decimals = max(0, min(4, 5 - int(np.floor(np.log10(abs(value))))))
+    formatted = f"{value:,.{decimals}f}"
+    return formatted.rstrip("0").rstrip(".") if decimals else formatted
+
+class ReportUnits:
+    """Convert SI results only for display; never mutate solver data."""
+
+    def __init__(self, system="SI"):
+        units = INPUT_UNITS[system]
+        imperial = system == "Imperial"
+        self.scales = {
+            "length": units["length"],
+            "diameter": units["length"] if imperial else 0.001,
+            "deflection": units["length"] if imperial else 0.001,
+            "force": units["force"],
+            "moment": units["moment"],
+            "stress": units["stress"] if imperial else 1e6,
+            "power": POWER_UNITS[units["power_unit"]],
+            "angle": 1.0, "slope": 1.0, "ratio": 1.0,
+        }
+        self.labels = {
+            "length": "in" if imperial else "m",
+            "diameter": "in" if imperial else "mm",
+            "deflection": "in" if imperial else "mm",
+            "force": "lbf" if imperial else "N",
+            "moment": "lbf*in" if imperial else "N*m",
+            "stress": "psi" if imperial else "MPa",
+            "power": units["power_unit"],
+            "angle": "deg", "slope": "rad", "ratio": "-",
+        }
+
+    def number(self, value, quantity):
+        return format_number(value / self.scales[quantity])
+
+    def row(self, name, value, quantity):
+        return (name, self.number(value, quantity), self.labels[quantity])
+
+def print_table(title, headers, rows, left_columns=(0,)):
+    """Print aligned ASCII tables that also work in redirected output."""
+    rows = [tuple(str(cell) for cell in row) for row in rows]
+    widths = [max([len(header), *(len(row[i]) for row in rows)])
+              for i, header in enumerate(headers)]
+
+    def line(cells):
+        return "  " + "  ".join(
+            cell.ljust(width) if i in left_columns else cell.rjust(width)
+            for i, (cell, width) in enumerate(zip(cells, widths))
+        )
+
+    print(f"\n{title}")
+    print(line(headers))
+    print(line(["-" * width for width in widths]))
+    for row in rows:
+        print(line(row))
+
+def print_load_table(title, loads, units):
+    headers = ("Type", f"x [{units.labels['length']}]", *(
+        f"{axis} [{units.labels[quantity]}]"
+        for quantity, axes in (("force", ("Fx", "Fy", "Fz")),
+                               ("moment", ("Mx", "My", "Mz")))
+        for axis in axes
+    ))
+    rows = [
+        (load["type"], units.number(load["position"], "length"),
+         *(units.number(value, quantity)
+           for quantity in ("force", "moment") for value in load[quantity]))
+        for load in loads
+    ]
+    print_table(title, headers, rows)
+
+def print_report(case, x_arr, all_loads, results, stresses, fos_msst,
+                 critical_idx, section_stresses):
+    """Print all results together, in the case's selected unit system."""
+    units = ReportUnits(case["unit_system"])
+    row = units.row
+    headers = ("Quantity", "Value", "Unit")
+    geometry = case["geometry"]
+    sigma, tau, sigma_vm = stresses
+    sigma_cs, tau_cs, _ = section_stresses
+    idx = critical_idx
+    critical_x = x_arr[idx]
+    target = case["target_factor_of_safety"]
+    bending = np.hypot(results["M_y"], results["M_z"])
+
+    print("\n" + "=" * 78)
+    print("BEAM STRESS ANALYSIS")
+    print("=" * 78)
+    print(f"  Case   : {case['case_path']}")
+    print(f"  Units  : {case['unit_system']} (terminal report)")
+    print(f"  Plots  : {case['unit_system']}, as labeled")
+    print("  Status : Global equilibrium verified")
+    print_table("CASE SUMMARY", headers, [
+        row("Beam length", case["length"], "length"),
+        row("Mesh spacing setting", case["mesh_density_factor"], "length"),
+        ("Mesh points", f"{len(x_arr):,}", "-"),
+        row("Young's modulus", case["material_properties"]["young_modulus"], "stress"),
+        row("Yield strength", case["yield_strength"], "stress"),
+        row("Target factor of safety", target, "ratio"),
+    ])
+    gears = [load for load in case["loads"] if load["type"] == "driving gear"]
+    if gears:
+        print_table("DRIVING GEARS", (
+            f"x [{units.labels['length']}]", f"Power [{units.labels['power']}]", "Speed [RPM]"
+        ), [(units.number(g["position"], "length"), units.number(g["power"], "power"),
+             format_number(g["speed"])) for g in gears], left_columns=())
+
+    print_load_table("APPLIED LOADS", case["loads"], units)
+    # Reactions are stored by degree of freedom; combine into one row per support.
+    reactions = {}
+    for load in all_loads:
+        if load["type"] != "reaction":
+            continue
+        reaction = reactions.setdefault(load["position"], {
+            "type": "reaction", "position": load["position"],
+            "force": np.zeros(3), "moment": np.zeros(3),
+        })
+        reaction["force"] += load["force"]
+        reaction["moment"] += load["moment"]
+    print_load_table("SUPPORT REACTIONS", list(reactions.values()), units)
+
+    peaks = []
+    for name, values in (("Bending M_y", results["M_y"]), ("Bending M_z", results["M_z"]),
+                         ("Resultant bending", bending), ("Torque T", results["T"])):
+        peak = np.argmax(np.abs(values))
+        peaks.append((*row(name, values[peak], "moment"), units.number(x_arr[peak], "length")))
+    print_table("PEAK INTERNAL MOMENTS (signed values at maximum magnitude)",
+                (*headers, f"x [{units.labels['length']}]"), peaks)
+
+    print_table("CRITICAL SECTION (minimum MSST/Tresca factor of safety)", headers, [
+        row("Position x", critical_x, "length"),
+        row("Current diameter", section_at(critical_x, geometry)["diameter"], "diameter"),
+        row("Von Mises stress", sigma_vm[idx], "stress"),
+        row("Normal stress sigma_x", sigma[idx], "stress"),
+        row("Torsional shear tau_xy", tau[idx], "stress"),
+        row("Factor of safety", fos_msst[idx], "ratio"),
+        row("Bending M_y", results["M_y"][idx], "moment"),
+        row("Bending M_z", results["M_z"][idx], "moment"),
+        row("Resultant bending", bending[idx], "moment"),
+        row("Torque T", results["T"][idx], "moment"),
+        row("Deflection y", results["delta_y"][idx], "deflection"),
+        row("Deflection z", results["delta_z"][idx], "deflection"),
+        row("Slope about y", results["theta_y"][idx], "slope"),
+        row("Slope about z", results["theta_z"][idx], "slope"),
+    ])
+    principal = principal_stresses(sigma[idx], tau[idx])
+    print_table("PRINCIPAL STRESSES (critical section, plane stress)", headers, [
+        row("Mohr circle center", principal["center"], "stress"),
+        row("Mohr circle radius / max shear", principal["radius"], "stress"),
+        row("Principal stress sigma_1", principal["sigma_1"], "stress"),
+        row("Principal stress sigma_2", principal["sigma_2"], "stress"),
+        row("Principal angle (2D)", principal["theta_p"], "angle"),
+    ])
+    tau_torsion_max = np.nanmax(np.abs(tau_cs))
+    tau_msst_max = np.nanmax(np.hypot(sigma_cs / 2, tau_cs))
+    section_fos = case["yield_strength"] / (2 * tau_msst_max) if tau_msst_max > 0 else np.inf
+    print_table("CROSS-SECTION GRID CHECK (critical section)", headers, [
+        row("Maximum torsional shear", tau_torsion_max, "stress"),
+        row("Maximum MSST/Tresca shear", tau_msst_max, "stress"),
+        row("Estimated factor of safety", section_fos, "ratio"),
+    ])
+
+    d_required = required_diameter_msst(bending, results["T"], case["yield_strength"], target)
+    required_idx = np.argmax(d_required)
+    required_x = x_arr[required_idx]
+    print_table("DIAMETER SIZING (MSST/Tresca)", headers, [
+        row("Target factor of safety", target, "ratio"),
+        row("Governing position x", required_x, "length"),
+        row("Required diameter", d_required[required_idx], "diameter"),
+        row("Current diameter", section_at(required_x, geometry)["diameter"], "diameter"),
+        row("Current factor of safety", fos_msst[required_idx], "ratio"),
+        row("Torque at sizing section", results["T"][required_idx], "moment"),
+    ])
+    recommendations = []
+    for seg in geometry:
+        below_target = (seg["start"] <= x_arr) & (x_arr <= seg["end"]) & (fos_msst < target)
+        if not np.any(below_target):
+            continue
+        indices = np.flatnonzero(below_target)
+        worst = indices[np.argmin(fos_msst[indices])]
+        recommended = np.max(d_required[indices])
+        recommendations.append((
+            units.number(x_arr[indices[0]], "length"), units.number(x_arr[indices[-1]], "length"),
+            units.number(seg["diameter"], "diameter"), units.number(recommended, "diameter"),
+            units.number(recommended - seg["diameter"], "diameter"),
+            format_number(fos_msst[worst]), units.number(x_arr[worst], "length"),
+        ))
+    if recommendations:
+        length_unit, diameter_unit = units.labels["length"], units.labels["diameter"]
+        print_table("DIAMETER RECOMMENDATIONS (sampled ranges below target FOS)", (
+            f"From [{length_unit}]", f"To [{length_unit}]", f"Current [{diameter_unit}]",
+            f"Required [{diameter_unit}]", f"Change [{diameter_unit}]", "Min FOS", f"At x [{length_unit}]"
+        ), recommendations, left_columns=())
+    else:
+        print(f"\n  All sections meet the target factor of safety ({format_number(target)}).")
+    print("=" * 78 + "\n")
+
+def run_case(case, show_plots=True):
+    """Solve in SI, print the complete report, then optionally display plots."""
+    geometry = case["geometry"]
+    prepare_geometry(geometry)
+    x_arr = np.linspace(0, case["length"], case["simulated_points"])
+    all_loads = build_load_list(case["loads"], case["supports"])
+    validate_global_equilibrium(all_loads)
+    results = compute_internal_loads(x_arr, all_loads)
+    deflection = compute_deflection(
+        x_arr, results, geometry, case["material_properties"], case["supports"]
+    )
+    results.update(zip(("theta_y", "theta_z", "delta_y", "delta_z"), deflection))
+    stresses = compute_stress(x_arr, results, geometry)
+    sigma, tau, _ = stresses
+    tau_msst = np.hypot(sigma / 2, tau)
+    fos_msst = np.divide(
+        case["yield_strength"], 2 * tau_msst,
+        out=np.full_like(tau_msst, np.inf), where=tau_msst > 0,
+    )
+    critical_idx = np.argmin(fos_msst)
+    critical_x = x_arr[critical_idx]
+    Y, Z, *section_stresses = critical_section_heatmap(critical_idx, x_arr, results, geometry)
+    print_report(case, x_arr, all_loads, results, stresses, fos_msst,
+                 critical_idx, section_stresses)
+
+    if not show_plots:
+        return
+    plot_beam_preview(case)
+    plot_diagrams(x_arr, results, critical_x, case["unit_system"])
+    plot_mohrs_circle(critical_idx, x_arr, results, geometry, case["unit_system"])
+    plot_section_heatmap(Y, Z, section_stresses, critical_x, case["unit_system"])
+
+
+def plot_section_heatmap(Y, Z, section_stresses, critical_x, unit_system="SI"):
+    units = ReportUnits(unit_system)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(f"Critical section at x = {units.number(critical_x, 'length')} {units.labels['length']}")
+    for ax, data, title in zip(
+        axes, section_stresses,
+        ["Normal stress sigma", "Shear stress tau", "Von Mises sigma_vm"]
+    ):
+        im = ax.contourf(Y / units.scales["diameter"], Z / units.scales["diameter"],
+                         data / units.scales["stress"], levels=100, cmap="RdBu_r")
+        plt.colorbar(im, ax=ax, label=units.labels["stress"])
+        ax.set_title(f"{title} ({units.labels['stress']})")
+        ax.set_aspect("equal")
+        ax.set_xlabel(f"y ({units.labels['diameter']})")
+        ax.set_ylabel(f"z ({units.labels['diameter']})")
+    plt.tight_layout()
+    plt.show()
+
 
 if __name__ == "__main__":
-
     case_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CASE
     if not case_path.is_file():
         sys.exit(f"Case file not found: {case_path}")
-    case = load_case(case_path)
-    print(f"Loaded case: {case_path}")
-    for load in case["loads"]:
-        if load["type"] == "driving gear":
-            print(f"  driving gear at x={load['position']} m: "
-                  f"{load['power_input']:g} {load['power_unit']} = {load['power']:.2f} W")
-
-    length              = case["length"]
-    simulated_points    = case["simulated_points"]
-    supports            = case["supports"]
-    material_properties = case["material_properties"]
-    geometry            = case["geometry"]
-    loads               = case["loads"]
-
-    prepare_geometry(geometry)
-
-    #preview drawing of the case
-    plot_beam_preview(case)
-
-    #build mesh
-    x_arr = np.linspace(0, length, simulated_points)
-
-    #solve reactions and build unified load list
-    all_loads = build_load_list(loads, supports)
-    validate_global_equilibrium(all_loads)
-    print(reactions := [load for load in all_loads if load["type"] == "reaction"])
-
-    # --- compute internal load diagrams ---
-    results = compute_internal_loads(x_arr, all_loads)
-    #debug_reactions(all_loads, loads)
-    Mz_max_idx = np.argmax(np.abs(results["M_z"]))
-    print(f"Maximum bending moment M_z = {results['M_z'][Mz_max_idx]:.2f} N·m at x = {x_arr[Mz_max_idx]:.4f} m")
-    My_max_idx = np.argmax(np.abs(results["M_y"]))
-    print(f"Maximum bending moment M_y = {results['M_y'][My_max_idx]:.2f} N·m at x = {x_arr[My_max_idx]:.4f} m")
-    M_total_max_idx = np.argmax(np.sqrt(results["M_y"]**2 + results["M_z"]**2))
-    print(f"Maximum resultant bending moment M_total = {np.sqrt(results['M_y'][M_total_max_idx]**2 + results['M_z'][M_total_max_idx]**2):.2f} N·m at x = {x_arr[M_total_max_idx]:.4f} m")
-    T_max_idx = np.argmax(np.abs(results["T"]))
-    print(f"Maximum internal torque T = {results['T'][T_max_idx]:.2f} N·m at x = {x_arr[T_max_idx]:.4f} m")
-
-    theta_y, theta_z, delta_y, delta_z = compute_deflection(x_arr, results, geometry, material_properties, supports)
-    results["theta_y"] = theta_y
-    results["theta_z"] = theta_z
-    results["delta_y"] = delta_y
-    results["delta_z"] = delta_z
-
-    #stress recovery along beam centerline
-    sigma, tau, sigma_vm = compute_stress(x_arr, results, geometry)
-
-    Sy = case["yield_strength"]           # yield strength (Pa)
-    n  = case["target_factor_of_safety"]  # target factor of safety
-    tau_msst = np.sqrt((sigma / 2)**2 + tau**2)
-    fos_msst = np.divide(
-        Sy,
-        2 * tau_msst,
-        out=np.full_like(tau_msst, np.inf),
-        where=tau_msst > 0,
-    )
-
-    #find critical section
-    critical_idx = np.argmin(fos_msst)
-    critical_x   = x_arr[critical_idx]
-    print(f"Critical section by current geometry MSST/Tresca FOS at x = {critical_x:.4f} m")
-    print(f"  sigma_vm = {sigma_vm[critical_idx]/1e6:.2f} MPa")
-    print(f"  sigma    = {sigma[critical_idx]/1e6:.2f} MPa")
-    print(f"  tau      = {tau[critical_idx]/1e6:.2f} MPa")
-    print(f"  FOS      = {fos_msst[critical_idx]:.2f}")
-    print(f"  M_y      = {results['M_y'][critical_idx]:.2f} N·m")
-    print(f"  M_z      = {results['M_z'][critical_idx]:.2f} N·m")
-    M_total = np.sqrt(results["M_y"][critical_idx]**2 + results["M_z"][critical_idx]**2)
-    print(f"  M_total  = {M_total:.2f} N·m")
-    Torque = results["T"][critical_idx]
-    print(f"  T        = {Torque:.2f} N·m")
-
-    plot_diagrams(x_arr, results, critical_x)
-
-    plot_mohrs_circle(critical_idx, x_arr, results, geometry)
-
-    #heatmap at critical section
-    Y, Z, sigma_cs, tau_cs, sigma_vm_cs = critical_section_heatmap(
-        critical_idx, x_arr, results, geometry
-    )
-
-    #plot
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle(f"Critical section at x = {critical_x:.4f} m")
-
-    tau_torsion_max = np.nanmax(np.abs(tau_cs))
-    tau_msst_max = np.nanmax(np.sqrt((sigma_cs / 2)**2 + tau_cs**2))
-    factor_of_safety = Sy / (2 * tau_msst_max)
-    print(f"Max torsional shear at section: {tau_torsion_max/1e6:.2f} MPa")
-    print(f"Max shear for yielding (MSST/Tresca): {tau_msst_max/1e6:.2f} MPa")
-    print(f"Estimated factor of safety against yielding (MSST/Tresca): {factor_of_safety:.2f}")
-
-    d_required = np.zeros(len(x_arr))
-    for i, x in enumerate(x_arr):
-        M = np.sqrt(results["M_y"][i]**2 + results["M_z"][i]**2)
-        T = results["T"][i]
-        d_required[i] = required_diameter_msst(M, T, Sy, n)
-
-    d_critical = np.max(d_required)
-    required_diameter_idx = np.argmax(d_required)
-    required_diameter_x = x_arr[required_diameter_idx]
-    print(f"Required diameter for FOS = {n} (MSST/Tresca): {d_critical*1e3:.2f} mm at x = {required_diameter_x:.4f} m")
-    print(f"  Current diameter at required-diameter section = {section_at(required_diameter_x, geometry)['diameter']*1e3:.2f} mm")
-    print(f"  Current FOS at required-diameter section = {fos_msst[required_diameter_idx]:.2f}")
-    print(f"  T at required-diameter section = {results['T'][required_diameter_idx]:.2f} N·m")
-
-    print(f"\nDiameter recommendations for FOS < {n}:")
-    recommendation_found = False
-    for seg in geometry:
-        in_segment = (seg["start"] <= x_arr) & (x_arr <= seg["end"])
-        below_target = in_segment & (fos_msst < n)
-
-        if not np.any(below_target):
-            continue
-
-        recommendation_found = True
-        segment_idxs = np.flatnonzero(below_target)
-        worst_idx = segment_idxs[np.argmin(fos_msst[segment_idxs])]
-        required_idx = segment_idxs[np.argmax(d_required[segment_idxs])]
-        current_diameter = seg["diameter"]
-        recommended_diameter = d_required[required_idx]
-        increase = recommended_diameter - current_diameter
-
-        print(
-            f"  x={x_arr[segment_idxs[0]]:.4f}-{x_arr[segment_idxs[-1]]:.4f} m: "
-            f"current d={current_diameter*1e3:.2f} mm, "
-            f"recommend d>={recommended_diameter*1e3:.2f} mm "
-            f"(increase {increase*1e3:.2f} mm), "
-            f"worst FOS={fos_msst[worst_idx]:.2f} at x={x_arr[worst_idx]:.4f} m"
-        )
-
-    if not recommendation_found:
-        print(f"  All sections meet FOS >= {n}.")
-
-    for ax, data, title in zip(
-        axes,
-        [sigma_cs, tau_cs, sigma_vm_cs],
-        ["Normal stress σ (Pa)", "Shear stress τ (Pa)", "Von Mises σ_vm (Pa)"]
-    ):
-        im = ax.contourf(Y, Z, data, levels=100, cmap="RdBu_r")
-        plt.colorbar(im, ax=ax)
-        ax.set_title(title)
-        ax.set_aspect("equal")
-        ax.set_xlabel("y (m)")
-        ax.set_ylabel("z (m)")
-
-    plt.tight_layout()
-    plt.show()
+    run_case(load_case(case_path))

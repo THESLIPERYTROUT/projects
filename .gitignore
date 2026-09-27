@@ -8,3 +8,5 @@ venv
 .claude-worktrees/
 .claude-worktree*/
 claude-worktrees/**
+**/darks**/
+**/flats**/

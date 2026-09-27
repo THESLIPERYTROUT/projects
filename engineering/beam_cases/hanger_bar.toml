@@ -3,10 +3,10 @@
 # Units: SI (m, N, N·m, Pa). Positions are measured from the left end of the beam.
 
 [units]
-system = "SI"                # Imperial: in, lbf, lbf*in, psi, lbm/in^3, hp
+system = "Imperial"                # Imperial: in, lbf, lbf*in, psi, lbm/in^3, hp
 
 [beam]
-length = 0.8
+length = 13
 mesh_density_factor = 0.0025   # spacing between simulated points (m)
 
 [material]
@@ -28,7 +28,7 @@ type = "fixed"
 # TODO: non-circular sections not supported yet.
 [[geometry]]
 start = 0.00
-end = 0.8
+end = 13
 diameter = 1
 
 # Loads. Supported types:
@@ -39,17 +39,13 @@ diameter = 1
 
 [[loads]]
 type = "point load"
-position = 0.8               # m
-force = [314.15, 157.07, -94.247]             # N
+position = 13               # m
+force = [0, -300, 0]             # N
 
 [[loads]]
 type = "point moment"
-position = 0.8               # m
-moment = [94.247, 0, 0]          # N·m
+position = 9               # m
+moment = [4500, 0, 0]          # N·m
 
-[[loads]]
-type = "point moment"
-position = 0.0              # m
-moment = [0, 314.15, 0]          # N·m
 
 

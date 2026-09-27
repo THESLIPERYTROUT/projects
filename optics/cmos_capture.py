@@ -1,107 +1,95 @@
-import ctypes
-import numpy as np
-from pyueye import ueye
 import os
+import sys
 import time
-import cv2
 
-def check(ret, msg="uEye call failed"):
-    # Some calls (e.g. is_FreezeVideo) return IS_CAPTURE_RUNNING (140) when the
-    # camera is actively capturing.  Treat that as success so the script doesn't
-    # throw a RuntimeError on a normal state.
-    if ret not in (ueye.IS_SUCCESS, ueye.IS_CAPTURE_RUNNING):
-        raise RuntimeError(f"{msg}. uEye ret={ret}")
+from ueye_common import open_camera, save_fits
 
-def disable_auto(h_cam):
-    zero = ueye.DOUBLE(0)
-    check(ueye.is_SetAutoParameter(h_cam, ueye.IS_SET_ENABLE_AUTO_SHUTTER, zero, None),
-          "disable auto shutter")
-    check(ueye.is_SetAutoParameter(h_cam, ueye.IS_SET_ENABLE_AUTO_GAIN, zero, None),
-          "disable auto gain")
+N_DARK_FRAMES = 20
+N_FLAT_FRAMES = 20
+FLAT_EXPOSURE_MS = 0.5  # ~half full-scale with the diffuser; matches a dark exposure
 
-def set_exposure_ms(h_cam, exposure_ms: float):
-    exp = ueye.DOUBLE(float(exposure_ms))
-    ret = ueye.is_Exposure(h_cam, ueye.IS_EXPOSURE_CMD_SET_EXPOSURE, exp, ctypes.sizeof(exp))
-    if ret != ueye.IS_SUCCESS:
-        raise RuntimeError(f"Set exposure failed. ret={ret}")
+EXPOSURES_MS = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.2, 0.3, 0.4, 0.5]
 
-def get_exposure_ms(h_cam) -> float:
-    exp = ueye.DOUBLE(0.0)
-    check(ueye.is_Exposure(h_cam, ueye.IS_EXPOSURE_CMD_GET_EXPOSURE, exp, ctypes.sizeof(exp)),
-          "get exposure")
-    return float(exp.value)
+
+def capture_light_sweep(cam, exposures, out_dir):
+    print(f"saving light frames to {out_dir}")
+    for exposure_ms in exposures:
+        cam.set_exposure_ms(exposure_ms)
+        applied = cam.get_exposure_ms()
+        print(f"Requested {exposure_ms} ms, applied {applied:.6f} ms")
+
+        cam.grab()  # flush
+        frame = cam.grab()
+
+        filename = f"exposure_{exposure_ms:.3f}ms.fits"
+        out_path = os.path.join(out_dir, filename)
+        save_fits(out_path, frame, applied, "LIGHT", cam.info)
+
+        mx = int(frame.max())
+        sat = int((frame == 255).sum())
+        print("  max pixel:", mx, " saturated px:", sat)
+
+        time.sleep(1)
+
+
+def capture_darks(cam, exposures, darks_dir, n_frames):
+    print(f"saving {n_frames} dark frames per exposure to {darks_dir}")
+    for exposure_ms in exposures:
+        cam.set_exposure_ms(exposure_ms)
+        applied = cam.get_exposure_ms()
+        print(f"Dark exposure requested {exposure_ms} ms, applied {applied:.6f} ms")
+
+        cam.grab()  # flush
+
+        for frame_idx in range(n_frames):
+            frame = cam.grab()
+            filename = f"dark_{exposure_ms:.3f}ms_frame{frame_idx:02d}.fits"
+            out_path = os.path.join(darks_dir, filename)
+            save_fits(out_path, frame, applied, "DARK", cam.info, extra={"FRAMENUM": frame_idx})
+
+        print(f"  saved {n_frames} frames")
+
+
+def capture_flats(cam, exposure_ms, flats_dir, n_frames):
+    print(f"saving {n_frames} flat frames to {flats_dir}")
+    cam.set_exposure_ms(exposure_ms)
+    applied = cam.get_exposure_ms()
+    print(f"Flat exposure requested {exposure_ms} ms, applied {applied:.6f} ms")
+
+    cam.grab()  # flush
+
+    for frame_idx in range(n_frames):
+        frame = cam.grab()
+        filename = f"flat_{exposure_ms:.3f}ms_frame{frame_idx:02d}.fits"
+        out_path = os.path.join(flats_dir, filename)
+        save_fits(out_path, frame, applied, "FLAT", cam.info, extra={"FRAMENUM": frame_idx})
+        print(f"  frame {frame_idx:02d}: mean {frame.mean():.1f}  max {int(frame.max())}  "
+              f"saturated px {int((frame == 255).sum())}")
+
 
 def main():
-    # prepare output folder next to this script
+    mode = sys.argv[1] if len(sys.argv) > 1 else "light"
+    if mode not in ("light", "darks", "flats"):
+        print(f'Unknown mode "{mode}". Use "light", "darks", or "flats [exposure_ms]".')
+        sys.exit(1)
+
     script_dir = os.path.dirname(__file__)
-    out_dir = os.path.join(script_dir, "output")
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"saving frames to {out_dir}")
 
-    h_cam = ueye.HIDS(0)
-    check(ueye.is_InitCamera(h_cam, None), "is_InitCamera")
-    try:
-        check(ueye.is_SetColorMode(h_cam, ueye.IS_CM_MONO8), "is_SetColorMode")
-        disable_auto(h_cam)
+    with open_camera() as cam:
+        if mode == "darks":
+            darks_dir = os.path.join(script_dir, "darks")
+            os.makedirs(darks_dir, exist_ok=True)
+            capture_darks(cam, EXPOSURES_MS, darks_dir, N_DARK_FRAMES)
+        elif mode == "flats":
+            exposure_ms = float(sys.argv[2]) if len(sys.argv) > 2 else FLAT_EXPOSURE_MS
+            flats_dir = os.path.join(script_dir, "flats")
+            os.makedirs(flats_dir, exist_ok=True)
+            capture_flats(cam, exposure_ms, flats_dir, N_FLAT_FRAMES)
+        else:
+            out_dir = os.path.join(script_dir, "output")
+            os.makedirs(out_dir, exist_ok=True)
+            capture_light_sweep(cam, EXPOSURES_MS, out_dir)
 
-        # Get AOI
-        rect_aoi = ueye.IS_RECT()
-        check(ueye.is_AOI(h_cam, ueye.IS_AOI_IMAGE_GET_AOI, rect_aoi, ctypes.sizeof(rect_aoi)),
-              "is_AOI GET")
-
-        width  = ueye.INT(int(rect_aoi.s32Width))
-        height = ueye.INT(int(rect_aoi.s32Height))
-        bits_per_pixel = ueye.INT(8)
-        pitch = ueye.INT()
-
-        mem_ptr = ueye.c_mem_p()
-        mem_id  = ueye.INT()
-
-        # Allocate once
-        check(ueye.is_AllocImageMem(h_cam, width, height, bits_per_pixel, mem_ptr, mem_id),
-              "is_AllocImageMem")
-        check(ueye.is_SetImageMem(h_cam, mem_ptr, mem_id), "is_SetImageMem")
-        check(ueye.is_InquireImageMem(h_cam, mem_ptr, mem_id, width, height, bits_per_pixel, pitch),
-              "is_InquireImageMem")
-
-        # Start capture once (helps settings apply consistently)
-        check(ueye.is_CaptureVideo(h_cam, ueye.IS_DONT_WAIT), "is_CaptureVideo")
-
-        exposures = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.2, 0.3, 0.4, 0.5]
-        for exposure_ms in exposures:
-            set_exposure_ms(h_cam, exposure_ms)
-            applied = get_exposure_ms(h_cam)
-            print(f"Requested {exposure_ms} ms, applied {applied:.6f} ms")
-
-            # Flush + grab
-            check(ueye.is_FreezeVideo(h_cam, ueye.IS_WAIT), "Freeze (flush)")
-            check(ueye.is_FreezeVideo(h_cam, ueye.IS_WAIT), "Freeze (grab)")
-
-            img = ueye.get_data(mem_ptr, width, height, bits_per_pixel, pitch, copy=True)
-            frame = np.reshape(img, (height.value, width.value))
-
-            filename = f"exposure_{exposure_ms:.3f}ms.png"
-            out_path = os.path.join(out_dir, filename)
-
-            cv2.imwrite(out_path, frame)
-
-            mx = int(frame.max())
-            sat = int((frame == 255).sum())
-            print("  max pixel:", mx, " saturated px:", sat)
-
-            time.sleep(1)
-
-        
-
-            
-
-
-        # Cleanup
-        ueye.is_StopLiveVideo(h_cam, ueye.IS_FORCE_VIDEO_STOP)
-        ueye.is_FreeImageMem(h_cam, mem_ptr, mem_id)
-
-    finally:
-        ueye.is_ExitCamera(h_cam)
 
 if __name__ == "__main__":
     main()

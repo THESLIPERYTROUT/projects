@@ -16,31 +16,31 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import numpy as np
 
-from ueye_common import open_camera, save_fits
+from ueye_cam import UEyeCamera
 
 
-def make_figure(frame: np.ndarray, exposure_ms: float):
+def make_figure(frame: np.ndarray, exposure_ms: float, vmax: int):
     h, w = frame.shape
     fig, ((ax_img, ax_hist), (ax_row, ax_col)) = plt.subplots(2, 2, figsize=(10, 8))
 
-    ax_img.imshow(frame, cmap="gray", vmin=0, vmax=255)
+    ax_img.imshow(frame, cmap="gray", vmin=0, vmax=vmax)
     ax_img.set_title("frame")
     ax_img.axis("off")
 
-    ax_hist.hist(frame.ravel(), bins=64, range=(0, 255), color="steelblue")
+    ax_hist.hist(frame.ravel(), bins=64, range=(0, vmax), color="steelblue")
     ax_hist.set_title("pixel histogram")
     ax_hist.set_xlabel("pixel value")
     ax_hist.set_ylabel("count")
-    ax_hist.set_xlim(0, 255)
+    ax_hist.set_xlim(0, vmax)
 
     ax_row.plot(frame[h // 2, :])
-    ax_row.set_ylim(0, 255)
+    ax_row.set_ylim(0, vmax)
     ax_row.set_title("center row profile")
     ax_row.set_xlabel("x (px)")
     ax_row.set_ylabel("pixel value")
 
     ax_col.plot(frame[:, w // 2])
-    ax_col.set_ylim(0, 255)
+    ax_col.set_ylim(0, vmax)
     ax_col.set_title("center column profile")
     ax_col.set_xlabel("y (px)")
     ax_col.set_ylabel("pixel value")
@@ -48,7 +48,7 @@ def make_figure(frame: np.ndarray, exposure_ms: float):
     mean = frame.mean()
     std = frame.std()
     flatness_pct = (std / mean * 100) if mean > 0 else float("inf")
-    sat_px = int((frame == 255).sum())
+    sat_px = int((frame >= vmax).sum())
     center = int(frame[h // 2, w // 2])
     corner = int(min(frame[0, 0], frame[0, -1], frame[-1, 0], frame[-1, -1]))
 
@@ -67,33 +67,28 @@ def main():
     preview_dir = os.path.join(script_dir, "flats", "preview")
     os.makedirs(preview_dir, exist_ok=True)
 
-    with open_camera() as cam:
-        cam.set_exposure_ms(exposure_ms)
-        applied = cam.get_exposure_ms()
+    with UEyeCamera() as cam:
+        # Warns (ExposureClampedWarning) if the camera can't do the requested
+        # exposure -- note the argument is in ms, e.g. 1000 for 1 s.
+        applied = cam.set_exposure_ms(exposure_ms)
         print(f"Requested {exposure_ms} ms, applied {applied:.6f} ms")
-        if abs(applied - exposure_ms) > 0.01 * exposure_ms:
-            print(f"WARNING: camera clamped exposure to {applied:.4f} ms "
-                  f"(note: argument is in ms, e.g. 1000 for 1 s)")
+        frame = cam.snap()
 
-        cam.grab()  # flush
-        frame = cam.grab()
+    data = frame.data
+    mean = data.mean()
+    std = data.std()
+    flatness_pct = (std / mean * 100) if mean > 0 else float("inf")
+    print(f"mean={mean:.1f}  std={std:.1f}  flatness={flatness_pct:.1f}% of mean  "
+          f"min={int(data.min())}  max={int(data.max())}  saturated={frame.n_saturated}px")
+    print("(lower flatness % = more uniform; compare center vs corner in the plot title "
+          "to spot vignetting/falloff)")
 
-        mean = frame.mean()
-        std = frame.std()
-        flatness_pct = (std / mean * 100) if mean > 0 else float("inf")
-        sat_px = int((frame == 255).sum())
-        print(f"mean={mean:.1f}  std={std:.1f}  flatness={flatness_pct:.1f}% of mean  "
-              f"min={int(frame.min())}  max={int(frame.max())}  saturated={sat_px}px")
-        print("(lower flatness % = more uniform; compare center vs corner in the plot title "
-              "to spot vignetting/falloff)")
+    fig = make_figure(data, applied, frame.saturation_value)
 
-        fig = make_figure(frame, applied)
-
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_fits(os.path.join(preview_dir, f"preview_{stamp}.fits"), frame, applied,
-                   "FLAT-PREVIEW", cam.info)
-        fig.savefig(os.path.join(preview_dir, f"preview_{stamp}.png"), dpi=120)
-        print(f"saved preview_{stamp}.fits / .png to {preview_dir}")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    frame.save_fits(os.path.join(preview_dir, f"preview_{stamp}.fits"), imagetyp="FLAT-PREVIEW")
+    fig.savefig(os.path.join(preview_dir, f"preview_{stamp}.png"), dpi=120)
+    print(f"saved preview_{stamp}.fits / .png to {preview_dir}")
 
     plt.show()
 

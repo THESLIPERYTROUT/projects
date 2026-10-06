@@ -2,7 +2,7 @@ import os
 import sys
 import time
 
-from ueye_common import open_camera, save_fits
+from ueye_cam import UEyeCamera
 
 N_DARK_FRAMES = 20
 N_FLAT_FRAMES = 20
@@ -14,57 +14,27 @@ EXPOSURES_MS = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.2, 
 def capture_light_sweep(cam, exposures, out_dir):
     print(f"saving light frames to {out_dir}")
     for exposure_ms in exposures:
-        cam.set_exposure_ms(exposure_ms)
-        applied = cam.get_exposure_ms()
+        applied = cam.set_exposure_ms(exposure_ms)
         print(f"Requested {exposure_ms} ms, applied {applied:.6f} ms")
 
-        cam.grab()  # flush
-        frame = cam.grab()
-
-        filename = f"exposure_{exposure_ms:.3f}ms.fits"
-        out_path = os.path.join(out_dir, filename)
-        save_fits(out_path, frame, applied, "LIGHT", cam.info)
-
-        mx = int(frame.max())
-        sat = int((frame == 255).sum())
-        print("  max pixel:", mx, " saturated px:", sat)
+        frame = cam.snap()
+        frame.save_fits(os.path.join(out_dir, f"exposure_{exposure_ms:.3f}ms.fits"), imagetyp="LIGHT")
+        print("  max pixel:", int(frame.data.max()), " saturated px:", frame.n_saturated)
 
         time.sleep(1)
 
 
-def capture_darks(cam, exposures, darks_dir, n_frames):
-    print(f"saving {n_frames} dark frames per exposure to {darks_dir}")
-    for exposure_ms in exposures:
-        cam.set_exposure_ms(exposure_ms)
-        applied = cam.get_exposure_ms()
-        print(f"Dark exposure requested {exposure_ms} ms, applied {applied:.6f} ms")
+def capture_series(cam, exposure_ms, n_frames, out_dir, prefix, imagetyp):
+    """n frames at one exposure, named <prefix>_<exp>ms_frameNN.fits (the
+    pattern build_masters.py groups on)."""
+    applied = cam.set_exposure_ms(exposure_ms)
+    print(f"{imagetyp} exposure requested {exposure_ms} ms, applied {applied:.6f} ms")
 
-        cam.grab()  # flush
-
-        for frame_idx in range(n_frames):
-            frame = cam.grab()
-            filename = f"dark_{exposure_ms:.3f}ms_frame{frame_idx:02d}.fits"
-            out_path = os.path.join(darks_dir, filename)
-            save_fits(out_path, frame, applied, "DARK", cam.info, extra={"FRAMENUM": frame_idx})
-
-        print(f"  saved {n_frames} frames")
-
-
-def capture_flats(cam, exposure_ms, flats_dir, n_frames):
-    print(f"saving {n_frames} flat frames to {flats_dir}")
-    cam.set_exposure_ms(exposure_ms)
-    applied = cam.get_exposure_ms()
-    print(f"Flat exposure requested {exposure_ms} ms, applied {applied:.6f} ms")
-
-    cam.grab()  # flush
-
-    for frame_idx in range(n_frames):
-        frame = cam.grab()
-        filename = f"flat_{exposure_ms:.3f}ms_frame{frame_idx:02d}.fits"
-        out_path = os.path.join(flats_dir, filename)
-        save_fits(out_path, frame, applied, "FLAT", cam.info, extra={"FRAMENUM": frame_idx})
-        print(f"  frame {frame_idx:02d}: mean {frame.mean():.1f}  max {int(frame.max())}  "
-              f"saturated px {int((frame == 255).sum())}")
+    for frame in cam.burst(n_frames):
+        filename = f"{prefix}_{exposure_ms:.3f}ms_frame{frame.index:02d}.fits"
+        frame.save_fits(os.path.join(out_dir, filename), imagetyp=imagetyp)
+        print(f"  frame {frame.index:02d}: mean {frame.data.mean():.1f}  max {int(frame.data.max())}  "
+              f"saturated px {frame.n_saturated}")
 
 
 def main():
@@ -75,16 +45,19 @@ def main():
 
     script_dir = os.path.dirname(__file__)
 
-    with open_camera() as cam:
+    with UEyeCamera() as cam:
         if mode == "darks":
             darks_dir = os.path.join(script_dir, "darks")
             os.makedirs(darks_dir, exist_ok=True)
-            capture_darks(cam, EXPOSURES_MS, darks_dir, N_DARK_FRAMES)
+            print(f"saving {N_DARK_FRAMES} dark frames per exposure to {darks_dir}")
+            for exposure_ms in EXPOSURES_MS:
+                capture_series(cam, exposure_ms, N_DARK_FRAMES, darks_dir, "dark", "DARK")
         elif mode == "flats":
             exposure_ms = float(sys.argv[2]) if len(sys.argv) > 2 else FLAT_EXPOSURE_MS
             flats_dir = os.path.join(script_dir, "flats")
             os.makedirs(flats_dir, exist_ok=True)
-            capture_flats(cam, exposure_ms, flats_dir, N_FLAT_FRAMES)
+            print(f"saving {N_FLAT_FRAMES} flat frames to {flats_dir}")
+            capture_series(cam, exposure_ms, N_FLAT_FRAMES, flats_dir, "flat", "FLAT")
         else:
             out_dir = os.path.join(script_dir, "output")
             os.makedirs(out_dir, exist_ok=True)

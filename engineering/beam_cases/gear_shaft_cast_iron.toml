@@ -1,5 +1,5 @@
 # Beam stress sim case file
-# Run with:  python beam_stress_sim.py beam_cases/gear_shaft.toml
+# Run with:  python beam_stress_sim.py beam_cases/gear_shaft_cast_iron.toml
 #
 # Positions are measured from the left end of the beam.
 # SI inputs: m, N, N*m, Pa, kg/m^3, W.
@@ -23,10 +23,27 @@ mesh_density_factor = 0.0025
 young_modulus = 29.0075e6      # psi, approximately 200 GPa
 poisson_ratio = 0.3           # dimensionless
 density = 0.283599            # lbm/in^3, approximately 7850 kg/m^3
-yield_strength = 29.0075e3    # psi, approximately 200 MPa
+yield_strength = 30.0e3    # psi, approximately 200 MPa
+ultimate_strength = 30.0e3    # psi; required only when [fatigue] is enabled
 
 [design]
 target_factor_of_safety = 2    # dimensionless, used for required-diameter / recommendation output
+
+
+[fatigue]
+criterion = "goodman"            # goodman | gerber | asme-elliptic | soderberg
+surface_finish = "machined"      # ground | machined | cold-drawn | hot-rolled | as-forged
+reliability = 0.5                # 0.5 -> ke = 1; e.g. 0.99 -> ke = 0.814
+temperature = 70                 # F for Imperial, C for SI; omitted -> kd = 1
+#endurance_limit = 29e3           # overrides Se' (default 0.5 Sut, capped at 700 MPa)
+torque_alternating_fraction = 0  # alternating torque as a fraction of steady torque
+
+# Shoulders are found from diameter steps between [[geometry]] segments. On the
+# segment AFTER a shoulder you may add:
+# fillet_radius = 0.03   # shoulder fillet radius; default assumes a sharp r = 0.02 d
+#   kf = 2.0               # direct bending fatigue factor (e.g. keyway, retaining-ring groove)
+#   kfs = 1.6              # direct torsion fatigue factor
+#                          # kf/kfs also work at a boundary with no diameter change
 
 # Supports. type = "bearing" (reacts Fy, Fz) or "fixed" (reacts Fx, Fy, Fz, Mx).
 [[supports]]
@@ -39,6 +56,7 @@ type = "bearing"
 
 # Geometry segments. Must be contiguous, start at 0 and end at beam length.
 # TODO: non-circular sections not supported yet.
+
 [[geometry]]
 start = 0.00              
 end = 9.0                   

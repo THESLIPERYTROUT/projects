@@ -1,0 +1,136 @@
+# Beam stress sim case file
+# Run with:  python beam_stress_sim.py beam_cases/gear_shaft_AISI1020.toml
+#
+# Positions are measured from the left end of the beam.
+# SI inputs: m, N, N*m, Pa, kg/m^3, W.
+# Imperial inputs: in, lbf, lbf*in, psi, lbm/in^3, hp.
+# The system applies to ALL dimensional inputs, including mesh spacing and
+# gear diameters. Changing the setting requires converting the numbers too.
+# Speed is always RPM; tooth angles are degrees; ratios are dimensionless.
+# An explicit power_unit overrides the system's power default.
+# Reports and plots follow the selected system (SI stresses in MPa, diameters and
+# deflections in mm; Imperial: in, lbf, lbf*in, psi, hp).
+
+[units]
+system = "Imperial"                 # "SI" (default when omitted) or "Imperial"
+
+[beam]
+length = 11.5                  
+mesh_density_factor = 0.0025   
+
+[material]
+# Original steel assumptions converted to Imperial units (no specific grade).
+young_modulus = 29.0075e6      # psi, approximately 200 GPa
+poisson_ratio = 0.3           # dimensionless
+density = 0.283599            # lbm/in^3, approximately 7850 kg/m^3
+yield_strength = 42.75e3    # psi, approximately 200 MPa
+ultimate_strength = 57.25e3    # psi; required only when [fatigue] is enabled
+
+[design]
+target_factor_of_safety = 2    # dimensionless, used for required-diameter / recommendation output
+
+
+[fatigue]
+criterion = "goodman"            # goodman | gerber | asme-elliptic | soderberg
+surface_finish = "machined"      # ground | machined | cold-drawn | hot-rolled | as-forged
+reliability = 0.5                # 0.5 -> ke = 1; e.g. 0.99 -> ke = 0.814
+temperature = 70                 # F for Imperial, C for SI; omitted -> kd = 1
+#endurance_limit = 29e3           # overrides Se' (default 0.5 Sut, capped at 700 MPa)
+torque_alternating_fraction = 0  # alternating torque as a fraction of steady torque
+
+# Shoulders are found from diameter steps between [[geometry]] segments. On the
+# segment AFTER a shoulder you may add:
+# fillet_radius = 0.03   # shoulder fillet radius; default assumes a sharp r = 0.02 d
+#   kf = 2.0               # direct bending fatigue factor (e.g. keyway, retaining-ring groove)
+#   kfs = 1.6              # direct torsion fatigue factor
+#                          # kf/kfs also work at a boundary with no diameter change
+
+# Supports. type = "bearing" (reacts Fy, Fz) or "fixed" (reacts Fx, Fy, Fz, Mx).
+[[supports]]
+position = 0.75          
+type = "bearing"
+
+[[supports]]
+position = 10.75         
+type = "bearing"
+
+# Geometry segments. Must be contiguous, start at 0 and end at beam length.
+# TODO: non-circular sections not supported yet.
+
+[[geometry]]
+start = 0.00              
+end = 0.25
+diameter = 0.25
+[[geometry]]
+start = 0.25
+end = 1.25
+diameter = 0.3
+fillet_radius = 0.0248      # 0.63 mm shoulder fillet
+[[geometry]]
+start = 1.25 
+end = 2.0
+diameter = 0.35
+fillet_radius = 0.0248      # 0.63 mm shoulder fillet
+[[geometry]]
+start = 2.0
+end = 3.5    
+diameter = 0.4
+fillet_radius = 0.0248      # 0.63 mm shoulder fillet
+[[geometry]]
+start = 3.5 
+end = 7.5 
+diameter = 0.5 
+fillet_radius = 0.0248      # 0.63 mm shoulder fillet
+[[geometry]]
+start = 7.5
+end = 9.5
+diameter = 0.4 
+fillet_radius = 0.0248      # 0.63 mm shoulder fillet
+[[geometry]]
+start = 9.5
+end = 10.25
+diameter = 0.35 
+fillet_radius = 0.0248      # 0.63 mm shoulder fillet
+[[geometry]]
+start = 10.25
+end = 11.25
+diameter = 0.3
+fillet_radius = 0.0248      # 0.63 mm shoulder fillet
+[[geometry]]
+start = 11.25
+end = 11.5
+diameter = 0.25
+fillet_radius = 0.0248      # 0.63 mm shoulder fillet
+
+# Loads. Supported types:
+#   "driving gear" - position, diameter, power, power_unit, speed (RPM), tooth_angle (deg)
+#                    power_unit: "W", "kW", "MW", "hp" (imperial), "PS" (metric).
+#                    Defaults to "W" for SI, "hp" for Imperial.
+#   "driven gear"  - position, diameter, tooth_angle (deg); takes power/speed from the driving gear
+#   "point load"   - position, force = [Fx, Fy, Fz]
+#   "point moment" - position, moment = [Mx, My, Mz]
+# Positions, diameters, forces and moments use the selected system above.
+# Both gear types require "meshing orientation": the mating external gear's
+# location relative to this shaft, viewed from the +x end toward the origin
+# with +y up: top = +y, bottom = -y, left = +z, right = -z.
+# tooth_angle is the spur-gear pressure angle in degrees; diameter is pitch diameter.
+# Torque convention: driving gear applies +Mx; driven gear applies -Mx.
+# Speed is a positive RPM magnitude. Radial force pushes away from the mate;
+# tangential force follows the torque sign. These gears are on the same shaft,
+# each meshing with a separate external gear, not directly with each other.
+
+[[loads]]
+type = "driving gear"
+"meshing orientation" = "right"  
+position = 2.719             
+diameter = 12               
+power = 20            
+speed = 389.375                  
+tooth_angle = 20            
+
+[[loads]]
+type = "driven gear"
+"meshing orientation" = "right"  
+position = 8.531          
+diameter = 2.67                
+tooth_angle = 25            

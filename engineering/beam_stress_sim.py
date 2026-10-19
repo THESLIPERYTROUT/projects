@@ -11,13 +11,13 @@ import numpy as np
 #
 # All case settings (beam, material, supports, geometry, loads) live in a TOML
 # case file so different sim cases can be saved independently of this program.
-# See beam_cases/gear_shaft.toml for a documented example.
+# See beam_cases/gear_shaft_stepped_shaft.toml for a documented example.
 #
 #   python beam_stress_sim.py                       -> runs DEFAULT_CASE
 #   python beam_stress_sim.py path/to/case.toml     -> runs that case
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CASE = SCRIPT_DIR / "beam_cases" / "gear_shaft.toml"
+DEFAULT_CASE = SCRIPT_DIR / "beam_cases" / "gear_shaft_stepped_shaft.toml"
 
 # Multipliers to convert a gear's "power" value to watts, keyed by "power_unit".
 POWER_UNITS = {

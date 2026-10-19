@@ -1,5 +1,5 @@
 # Beam stress sim case file
-# Run with:  python beam_stress_sim.py beam_cases/gear_shaft_AISI1020.toml
+# Run with:  python beam_stress_sim.py beam_cases/gear_shaft_stepped_shaft.toml
 #
 # Positions are measured from the left end of the beam.
 # SI inputs: m, N, N*m, Pa, kg/m^3, W.

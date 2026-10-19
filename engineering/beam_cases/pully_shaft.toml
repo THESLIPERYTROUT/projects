@@ -1,0 +1,64 @@
+# Beam stress sim case file
+# Run with:  python beam_stress_sim.py beam_cases/pully_shaft.toml
+
+[units]
+system = "Imperial"                # Imperial: in, lbf, lbf*in, psi, lbm/in^3, hp
+
+[beam]
+length = 40
+mesh_density_factor = 0.0025   # spacing between simulated points (m)
+
+[material]
+young_modulus = 200e9
+poisson_ratio = 0.3
+density = 7850
+yield_strength = 71e3
+
+[design]
+target_factor_of_safety = 2    
+
+# Supports. type = "bearing" (reacts Fy, Fz) or "fixed" (reacts Fx, Fy, Fz, Mx).
+[[supports]]
+position = 0.0
+type = "bearing"
+
+[[supports]]
+position = 40.0
+type = "bearing"
+
+
+# Geometry segments. Must be contiguous, start at 0 and end at beam length.
+# TODO: non-circular sections not supported yet.
+[[geometry]]
+start = 0.00
+end = 40.0
+diameter = 1.25
+
+# Loads. Supported types:
+#   "driving gear" - position, diameter, power (W), speed (RPM), tooth_angle (deg)
+#   "driven gear"  - position, diameter, tooth_angle (deg); takes power/speed from the driving gear
+#   "point load"   - position, force = [Fx, Fy, Fz]
+#   "point moment" - position, moment = [Mx, My, Mz]
+
+[[loads]]
+type = "point load"
+position = 10.0              
+force = [0, 0, 575]             
+
+[[loads]]
+type = "point moment"
+position = 10.0             
+moment = [1700.0, 0, 0]    
+
+[[loads]]
+type = "point load"
+position = 28.0              
+force = [0, 0, 402.5]             
+
+[[loads]]
+type = "point moment"
+position = 28.0             
+moment = [-1700.0, 0, 0] 
+
+
+

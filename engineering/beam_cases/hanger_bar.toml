@@ -1,5 +1,5 @@
 # Beam stress sim case file
-# Run with:  python beam_stress_sim.py beam_cases/gear_shaft.toml
+# Run with:  python beam_stress_sim.py beam_cases/hanger_bar.toml
 # Units: SI (m, N, N·m, Pa). Positions are measured from the left end of the beam.
 
 [units]

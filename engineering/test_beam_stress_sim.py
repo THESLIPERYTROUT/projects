@@ -75,6 +75,41 @@ tooth_angle = 20
 '''
 
 
+def fatigue_case_text(system="Imperial", criterion="goodman"):
+    """case_text plus Sut, a [fatigue] section and a fillet at the x = 10 in shoulder."""
+    imperial = system.casefold() == "imperial"
+    stress = 1.0 if imperial else 6894.757293168361
+    length = 1.0 if imperial else 0.0254
+    temperature = 300 if imperial else (300 - 32) * 5 / 9
+    text = case_text(system)
+    text = text.replace(f"yield_strength = {36000 * stress}\n",
+                        f"yield_strength = {36000 * stress}\nultimate_strength = {58000 * stress}\n")
+    text = text.replace("[design]", f'''[fatigue]
+criterion = "{criterion}"
+surface_finish = "machined"
+reliability = 0.99
+temperature = {temperature}
+torque_alternating_fraction = 0.1
+[design]''')
+    return text.replace(f"start = {10 * length}\n",
+                        f"start = {10 * length}\nfillet_radius = {0.05 * length}\n")
+
+
+def load_text(content):
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "case.toml"
+        path.write_text(content, encoding="utf-8")
+        return sim.load_case(path)
+
+
+def solve(case):
+    sim.prepare_geometry(case["geometry"])
+    x = sim.build_stations(case["length"], case["simulated_points"], case["geometry"])
+    loads = sim.build_load_list(case["loads"], case["supports"])
+    results = sim.compute_internal_loads(x, loads)
+    return x, results
+
+
 class InputUnitsTests(unittest.TestCase):
     def load_text(self, content):
         with tempfile.TemporaryDirectory() as directory:
@@ -340,6 +375,351 @@ class PlotUnitsTests(unittest.TestCase):
                     self.assertEqual(case, original_case)
                     for key in results:
                         np.testing.assert_array_equal(results[key], original_results[key])
+                finally:
+                    sim.plt.close("all")
+
+
+class BeamPreviewTests(unittest.TestCase):
+    def test_gears_are_schematic_and_axes_fit_the_shaft(self):
+        sim.plt.switch_backend("Agg")
+        # A 40 in gear on a 2 in shaft: drawn to scale it would flatten the shaft.
+        text = case_text().replace("diameter = 6.0", "diameter = 40.0")
+        case = load_text(text)
+        sim.prepare_geometry(case["geometry"])
+        sim.plt.close("all")
+        try:
+            with patch.object(sim.plt, "show"):
+                sim.plot_beam_preview(case)
+            ax = sim.plt.gcf().axes[0]
+            h = 1.0   # largest shaft radius, in inches
+            self.assertLessEqual(ax.get_ylim()[1], 8 * h)
+            self.assertGreaterEqual(ax.get_ylim()[0], -8 * h)
+            text = "\n".join(t.get_text() for t in ax.texts)
+            self.assertIn("D = 40 in", text)
+            self.assertIn("mesh: top (+y)", text)
+            self.assertIn("not to scale", ax.get_title())
+            self.assertIn("Ø2", text)   # diameter labels moved below the shaft
+            # Gear blanks stay within a few shaft radii, larger gear drawn taller.
+            blanks = [p for p in ax.patches if isinstance(p, sim.plt.Rectangle)
+                      and p.get_alpha() == 0.25]
+            heights = sorted(p.get_height() for p in blanks)
+            self.assertEqual(len(heights), 2)
+            self.assertLess(heights[0], heights[1])
+            self.assertLessEqual(heights[1], 7 * h)
+        finally:
+            sim.plt.close("all")
+
+
+class SolverStationTests(unittest.TestCase):
+    def test_cumulative_trapezoid_matches_running_trapezoid(self):
+        x = np.sort(np.random.default_rng(1).uniform(0, 3, 50))
+        y = np.sin(x) * x
+        expected = [np.trapezoid(y[:i + 1], x[:i + 1]) for i in range(len(x))]
+        np.testing.assert_allclose(sim.cumulative_trapezoid(y, x), expected, atol=1e-14)
+
+    def test_vectorized_internal_loads_match_pointwise_singularity_sum(self):
+        case = load_text(case_text())
+        x, results = solve(case)
+        loads = sim.build_load_list(case["loads"], case["supports"])
+        for i in (0, 17, len(x) // 2, len(x) - 1):
+            m_z = sum(l["force"][1] * sim.S(x[i], l["position"], 1)
+                      - l["moment"][2] * sim.S(x[i], l["position"], 0) for l in loads)
+            torque = sum(l["moment"][0] * sim.S(x[i], l["position"], 0) for l in loads)
+            self.assertAlmostEqual(results["M_z"][i], m_z)
+            self.assertAlmostEqual(results["T"][i], torque)
+        self.assertIsInstance(sim.S(1.0, 0.5, 1), float)
+
+    def test_shoulders_are_stations_and_use_the_smaller_section(self):
+        case = load_text(case_text())
+        sim.prepare_geometry(case["geometry"])
+        shoulder = 10 * 0.0254
+        x = sim.build_stations(case["length"], case["simulated_points"], case["geometry"])
+        self.assertIn(shoulder, x)
+        self.assertEqual(len(x), case["simulated_points"] + 1)
+        self.assertAlmostEqual(sim.section_at(shoulder, case["geometry"])["diameter"], 0.0254)
+        # Reversed step: the smaller segment is now on the left of the boundary.
+        flipped = [dict(case["geometry"][0], diameter=0.0508), dict(case["geometry"][1], diameter=0.0254)]
+        self.assertAlmostEqual(sim.section_at(shoulder, flipped)["diameter"], 0.0254)
+        with self.assertRaisesRegex(ValueError, "outside the beam geometry"):
+            sim.section_at(-0.1, case["geometry"])
+
+
+class FatigueTests(unittest.TestCase):
+    PSI = 6894.757293168361
+
+    def fatigue(self, system="Imperial", criterion="goodman"):
+        case = load_text(fatigue_case_text(system, criterion))
+        x, results = solve(case)
+        return case, x, results, sim.compute_fatigue(x, results, case["geometry"], case)
+
+    def test_kt_fits_match_peterson_chart_readings(self):
+        # (D/d, r/d, bending Kt, torsion Kts) read from Shigley Figs A-15-9 / A-15-8.
+        for D_d, r_d, kt, kts in ((1.5, 0.1, 1.68, 1.42), (2.0, 0.05, 2.1, 1.75), (1.2, 0.1, 1.6, 1.35)):
+            with self.subTest(D_d=D_d, r_d=r_d):
+                self.assertAlmostEqual(sim.shoulder_kt(D_d, 1, r_d, sim.KT_BENDING), kt, delta=0.06 * kt)
+                self.assertAlmostEqual(sim.shoulder_kt(D_d, 1, r_d, sim.KT_TORSION), kts, delta=0.06 * kts)
+        self.assertEqual(sim.shoulder_kt(1.0, 1, 0.05, sim.KT_BENDING), 1.0)
+        self.assertEqual(sim.shoulder_kt(1.0, 1, 0.05, sim.KT_TORSION), 1.0)
+
+    def test_notch_sensitivity_and_marin_factors(self):
+        # Shigley Fig 6-20: Sut = 100 kpsi, r = 0.1 in -> q ~ 0.84.
+        self.assertAlmostEqual(sim.notch_sensitivity(0.1 * 0.0254, 100e3 * self.PSI), 0.84, delta=0.01)
+        settings = {"surface_finish": "machined", "temperature_f": 500,
+                    "reliability": 0.99, "endurance_limit": None}
+        marin = sim.marin_factors(0.025, 690e6, settings)
+        self.assertAlmostEqual(marin["ka"], 4.51 * 690**-0.265)
+        self.assertAlmostEqual(float(marin["kb"]), 1.24 * 25**-0.107)
+        self.assertAlmostEqual(marin["kd"], 0.995, delta=0.002)  # Shigley Table 6-4 (vs. its polynomial fit)
+        self.assertAlmostEqual(marin["ke"], 0.814, places=3)    # Shigley Table 6-5
+        self.assertAlmostEqual(marin["Se_prime"], 345e6)
+        self.assertAlmostEqual(sim.marin_factors(0.025, 1600e6, settings)["Se_prime"], 700e6)
+        self.assertAlmostEqual(float(sim.marin_factors(0.1, 690e6, settings)["kb"]), 1.51 * 100**-0.157)
+
+    def test_criteria_limits_and_ordering(self):
+        Se, Sut, Sy = 200e6, 600e6, 400e6
+        for criterion in sim.FATIGUE_CRITERIA:
+            with self.subTest(criterion=criterion):
+                # Fully reversed only: every criterion reduces to Se / sigma_a.
+                self.assertAlmostEqual(float(sim.fatigue_fos(50e6, 0, Se, Sut, Sy, criterion)), 4)
+                self.assertEqual(float(sim.fatigue_fos(0, 0, Se, Sut, Sy, criterion)), np.inf)
+        n = {c: float(sim.fatigue_fos(80e6, 150e6, Se, Sut, Sy, c)) for c in sim.FATIGUE_CRITERIA}
+        self.assertAlmostEqual(n["goodman"], 1 / (80 / 200 + 150 / 600))
+        self.assertAlmostEqual(n["soderberg"], 1 / (80 / 200 + 150 / 400))
+        self.assertAlmostEqual(n["asme-elliptic"], 1 / np.hypot(80 / 200, 150 / 400))
+        self.assertGreater(n["gerber"], n["goodman"])
+        self.assertGreater(n["goodman"], n["soderberg"])
+        gerber = n["gerber"]   # the operating point scaled by n lies on the Gerber parabola
+        self.assertAlmostEqual(gerber * 80e6 / Se + (gerber * 150e6 / Sut)**2, 1)
+        self.assertAlmostEqual(float(sim.fatigue_fos(0, 150e6, Se, Sut, Sy, "gerber")), 4)
+
+    def test_fatigue_matches_hand_calculation_at_critical_and_shoulder(self):
+        case, x, results, fatigue = self.fatigue()
+        shoulder = int(np.flatnonzero(x == 10 * 0.0254)[0])
+        raiser = fatigue["raisers"][0]
+        self.assertFalse(raiser["r_assumed"])
+        q = sim.notch_sensitivity(0.05 * 0.0254, 58e3 * self.PSI)
+        kt = sim.shoulder_kt(2, 1, 0.05, sim.KT_BENDING)
+        self.assertAlmostEqual(fatigue["Kf"][shoulder], 1 + q * (kt - 1))
+        self.assertEqual(fatigue["Kf"][shoulder - 1], 1)
+        for i in (fatigue["critical_idx"], shoulder):
+            with self.subTest(station=i):
+                d = fatigue["diameter"][i]
+                M = np.hypot(results["M_y"][i], results["M_z"][i])
+                sigma_a = fatigue["Kf"][i] * 32 * M / (np.pi * d**3)
+                tau_m = fatigue["Kfs"][i] * 16 * abs(results["T"][i]) / (np.pi * d**3)
+                sigma_m = fatigue["Kf"][i] * 4 * abs(results["N"][i]) / (np.pi * d**2)
+                vm_a = np.hypot(sigma_a, np.sqrt(3) * 0.1 * tau_m)
+                vm_m = np.hypot(sigma_m, np.sqrt(3) * tau_m)
+                se = (4.51 * (58e3 * self.PSI / 1e6)**-0.265 * 1.24 * (d * 1e3)**-0.107
+                      * (0.975 + 0.432e-3 * 300 - 0.115e-5 * 300**2 + 0.104e-8 * 300**3 - 0.595e-12 * 300**4)
+                      * (1 - 0.08 * 2.3263478740408408) * 29e3 * self.PSI)
+                self.assertAlmostEqual(fatigue["Se"][i] / se, 1)
+                self.assertAlmostEqual(fatigue["fos_fatigue"][i] * (vm_a / se + vm_m / (58e3 * self.PSI)), 1)
+                vm_max = np.hypot(sigma_a + sigma_m, np.sqrt(3) * 1.1 * tau_m)
+                self.assertAlmostEqual(fatigue["fos_yield"][i] * vm_max / (36e3 * self.PSI), 1)
+
+    def test_required_diameter_meets_target(self):
+        case, x, results, fatigue = self.fatigue()
+        target = case["target_factor_of_safety"]
+        i = int(np.argmax(fatigue["d_required"]))
+        d = np.array([fatigue["d_required"][i]])
+        M = np.hypot(results["M_y"][i:i + 1], results["M_z"][i:i + 1])
+        _, _, n_f, n_y = sim._fatigue_and_yield_fos(d, M, results["T"][i:i + 1], results["N"][i:i + 1],
+                                                    fatigue["Kf"][i:i + 1], fatigue["Kfs"][i:i + 1], case)
+        self.assertAlmostEqual(min(n_f[0], n_y[0]), target, places=6)
+
+    def test_si_and_imperial_fatigue_agree(self):
+        for criterion in sim.FATIGUE_CRITERIA:
+            with self.subTest(criterion=criterion):
+                *_, si = self.fatigue("SI", criterion)
+                *_, imperial = self.fatigue("Imperial", criterion)
+                for key in ("fos_fatigue", "fos_yield", "Se", "Kf", "Kfs", "d_required"):
+                    np.testing.assert_allclose(si[key], imperial[key], rtol=1e-6)
+
+    def test_every_criterion_is_evaluated_and_selected_one_governs(self):
+        for selected in ("gerber", "asme-elliptic"):
+            with self.subTest(selected=selected):
+                case, x, results, fatigue = self.fatigue(criterion=selected)
+                self.assertEqual(set(fatigue["fos_by_criterion"]), set(sim.FATIGUE_CRITERIA))
+                np.testing.assert_array_equal(fatigue["fos_fatigue"], fatigue["fos_by_criterion"][selected])
+                np.testing.assert_array_equal(fatigue["d_required"], fatigue["d_required_by_criterion"][selected])
+                self.assertEqual(fatigue["critical_idx"], int(np.argmin(fatigue["fos_by_criterion"][selected])))
+                for criterion, fos in fatigue["fos_by_criterion"].items():
+                    np.testing.assert_allclose(fos, sim.fatigue_fos(
+                        fatigue["vm_a"], fatigue["vm_m"], fatigue["Se"],
+                        case["ultimate_strength"], case["yield_strength"], criterion))
+        # With a mean stress present Gerber is the least and Soderberg the most conservative.
+        loaded = fatigue["vm_m"] > 0
+        by = fatigue["fos_by_criterion"]
+        self.assertTrue(np.all(by["gerber"][loaded] >= by["goodman"][loaded]))
+        self.assertTrue(np.all(by["goodman"][loaded] >= by["soderberg"][loaded]))
+        self.assertTrue(np.all(by["asme-elliptic"][loaded] >= by["soderberg"][loaded]))
+        required = fatigue["d_required_by_criterion"]
+        self.assertTrue(np.all(required["gerber"] <= required["goodman"] * (1 + 1e-9)))
+        self.assertTrue(np.all(required["goodman"] <= required["soderberg"] * (1 + 1e-9)))
+
+    def test_report_includes_fatigue_only_when_enabled(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            sim.run_case(load_text(fatigue_case_text()), show_plots=False)
+        report = output.getvalue()
+        for title in ("FATIGUE ANALYSIS - Modified Goodman", "ENDURANCE LIMIT", "STRESS RAISERS",
+                      "FATIGUE CRITICAL SECTION", "FATIGUE DIAMETER SIZING"):
+            self.assertIn(title, report)
+        self.assertRegex(report, r"Temperature factor kd\s+[\d.]+\s+- \(at 300 F\)")
+        self.assertIn("FATIGUE CRITERIA COMPARISON", report)
+        for name in sim.FATIGUE_CRITERIA.values():
+            self.assertRegex(report, rf"\n  {re.escape(name)}(?: \(selected\))?\s+[\d.]+\s+[\d.]+")
+        self.assertIn("Modified Goodman (selected)", report)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            sim.run_case(load_text(case_text()), show_plots=False)
+        self.assertNotIn("FATIGUE", output.getvalue())
+
+    def test_assumed_sharp_fillet_and_overrides(self):
+        text = fatigue_case_text().replace("fillet_radius = 0.05\n", "")
+        case = load_text(text)
+        sim.prepare_geometry(case["geometry"])
+        raiser = sim.stress_raisers(case["geometry"], case["ultimate_strength"])[0]
+        self.assertTrue(raiser["r_assumed"])
+        self.assertAlmostEqual(raiser["r"], 0.02 * 0.0254)
+        case = load_text(fatigue_case_text().replace("fillet_radius = 0.05\n", "kf = 2.2\nkfs = 1.8\n"))
+        raiser = sim.stress_raisers(case["geometry"], case["ultimate_strength"])[0]
+        self.assertEqual((raiser["Kf"], raiser["Kfs"], raiser["override"]), (2.2, 1.8, True))
+
+    def test_fillet_outside_kt_fit_range_is_warned(self):
+        # 0.63 in on a 1 in shaft (r/d = 0.63): a likely in-vs-mm slip.
+        for fillet, extra, warned in (("0.05", "", False), ("0.63", "", True), ("0.005", "", True),
+                                      ("0.63", "kf = 2.0\nkfs = 1.6\n", False)):
+            with self.subTest(fillet=fillet, override=bool(extra)):
+                text = fatigue_case_text().replace("fillet_radius = 0.05\n", f"fillet_radius = {fillet}\n{extra}")
+                case = load_text(text)
+                sim.prepare_geometry(case["geometry"])
+                raiser = sim.stress_raisers(case["geometry"], case["ultimate_strength"])[0]
+                self.assertEqual(bool(raiser["warnings"]), warned)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    sim.run_case(load_text(text), show_plots=False)
+                report = output.getvalue()
+                self.assertEqual("WARNING at x = 10 in: r/d" in report, warned)
+                self.assertEqual("WARNING: r/d out of range" in report, warned)
+
+    def test_fatigue_input_validation(self):
+        good = fatigue_case_text()
+        cases = {
+            "ultimate_strength": (KeyError, good.replace("ultimate_strength = 58000.0\n", "")),
+            "criterion must be": (ValueError, good.replace('"goodman"', '"walker"')),
+            "surface_finish must be": (ValueError, good.replace('"machined"', '"polished"')),
+            "reliability": (ValueError, good.replace("reliability = 0.99", "reliability = 1.0")),
+            "unknown key": (KeyError, good.replace("[fatigue]\n", "[fatigue]\nlife = 1e6\n")),
+            "at least yield_strength": (ValueError, good.replace("ultimate_strength = 58000.0", "ultimate_strength = 30000.0")),
+            "first segment": (ValueError, good.replace("start = 0.0\n", "start = 0.0\nkf = 2.0\n")),
+            "temperature": (ValueError, good.replace("temperature = 300", "temperature = 1200")),
+        }
+        for message, (error, text) in cases.items():
+            with self.subTest(message=message), self.assertRaisesRegex(error, message):
+                load_text(text)
+
+    def test_fatigue_requires_shoulder_stations(self):
+        case = load_text(fatigue_case_text())
+        sim.prepare_geometry(case["geometry"])
+        x = np.linspace(0, case["length"], 40)
+        results = sim.compute_internal_loads(x, sim.build_load_list(case["loads"], case["supports"]))
+        with self.assertRaisesRegex(ValueError, "build_stations"):
+            sim.compute_fatigue(x, results, case["geometry"], case)
+
+    def test_fatigue_diagram_keeps_operating_point_visible(self):
+        sim.plt.switch_backend("Agg")
+        case, x, results, fatigue = self.fatigue()
+        i = fatigue["critical_idx"]
+        units = sim.ReportUnits("Imperial")
+        Sut, Sy = case["ultimate_strength"], case["yield_strength"]
+        # How far the point is beyond the envelope axes, on its binding axis.
+        reach = max(fatigue["vm_m"][i] / (1.05 * max(Sut, Sy)),
+                    fatigue["vm_a"][i] / (1.05 * max(fatigue["Se"][i], Sy)))
+        self.assertLess(reach, 1)
+        for scale_up, off_scale in ((1, False), (2 / reach, False), (30 / reach, True)):
+            with self.subTest(scale_up=scale_up):
+                data = dict(fatigue, vm_a=fatigue["vm_a"] * scale_up, vm_m=fatigue["vm_m"] * scale_up)
+                sim.plt.close("all")
+                try:
+                    with patch.object(sim.plt, "show"):
+                        sim.plot_fatigue_diagram(x, data, case)
+                    ax = sim.plt.gcf().axes[0]
+                    px, py = data["vm_m"][i] / units.scales["stress"], data["vm_a"][i] / units.scales["stress"]
+                    labels = "\n".join(line.get_label() for line in ax.lines)
+                    self.assertEqual("off scale" in labels, off_scale)
+                    if off_scale:
+                        # The load line ends inside the axes, pointing at the real point.
+                        load_line = next(line for line in ax.lines if line.get_label() == "load line")
+                        end = load_line.get_xydata()[-1]
+                        self.assertLess(end[0], ax.get_xlim()[1])
+                        self.assertLess(end[1], ax.get_ylim()[1])
+                        self.assertAlmostEqual(end[1] / end[0], py / px)
+                    else:
+                        self.assertLessEqual(px, ax.get_xlim()[1])
+                        self.assertLessEqual(py, ax.get_ylim()[1])
+                finally:
+                    sim.plt.close("all")
+
+    def test_fatigue_diagram_marks_target_fos_point_with_required_diameter(self):
+        sim.plt.switch_backend("Agg")
+        units = sim.ReportUnits("Imperial")
+        for criterion in sim.FATIGUE_CRITERIA:
+            with self.subTest(criterion=criterion):
+                case, x, results, fatigue = self.fatigue(criterion=criterion)
+                i = fatigue["critical_idx"]
+                d_req = fatigue["d_required"][i]
+                sim.plt.close("all")
+                try:
+                    with patch.object(sim.plt, "show"):
+                        sim.plot_fatigue_diagram(x, fatigue, case)
+                    ax = sim.plt.gcf().axes[0]
+                    star = next(line for line in ax.lines if line.get_marker() == "*")
+                    self.assertIn(f"required d = {units.number(d_req, 'diameter')} in", star.get_label())
+                    self.assertTrue(any(f"required d = {units.number(d_req, 'diameter')} in" in t.get_text()
+                                        for t in ax.texts))
+                    # At the required diameter the governing FOS (fatigue or Langer) equals the target.
+                    vm_m, vm_a = (v * units.scales["stress"] for v in star.get_xydata()[0])
+                    Se = float(sim.marin_factors(d_req, case["ultimate_strength"], case["fatigue"])["Se"])
+                    n_f = float(sim.fatigue_fos(vm_a, vm_m, Se, case["ultimate_strength"],
+                                                case["yield_strength"], criterion))
+                    state = sim.fatigue_stress_state(d_req, fatigue["M"][i], fatigue["T"][i], fatigue["N"][i],
+                                                     fatigue["Kf"][i], fatigue["Kfs"][i], 0.1)
+                    n_y = case["yield_strength"] / state["vm_max"]
+                    self.assertAlmostEqual(min(n_f, n_y), case["target_factor_of_safety"], places=5)
+                    # When fatigue governs, the star sits on the drawn design line.
+                    design = next(line for line in ax.lines if "design line" in line.get_label())
+                    if n_f < n_y:
+                        sx, sy = star.get_xydata()[0]
+                        line_x, line_y = design.get_xydata().T
+                        self.assertAlmostEqual(np.interp(sx, line_x, line_y) / sy, 1, places=3)
+                finally:
+                    sim.plt.close("all")
+
+    def test_fatigue_plots_render_in_selected_units(self):
+        sim.plt.switch_backend("Agg")
+        for system in ("SI", "Imperial"):
+            with self.subTest(system=system):
+                case, x, results, fatigue = self.fatigue(system)
+                units = sim.ReportUnits(system)
+                static = np.full(len(x), 5.0)
+                sim.plt.close("all")
+                try:
+                    with patch.object(sim.plt, "show"):
+                        sim.plot_fatigue_fos(x, static, fatigue, case)
+                        ax = sim.plt.gcf().axes[0]
+                        np.testing.assert_allclose(ax.lines[0].get_xdata(), x / units.scales["length"])
+                        sim.plot_fatigue_diagram(x, fatigue, case)
+                        ax = sim.plt.gcf().axes[0]
+                        self.assertIn(units.labels["stress"], ax.get_xlabel())
+                        i = fatigue["critical_idx"]
+                        # Four criterion envelopes, then the Langer line, then the operating point.
+                        self.assertEqual(sum("(selected)" in line.get_label() for line in ax.lines), 1)
+                        point = ax.lines[len(sim.FATIGUE_CRITERIA) + 1]
+                        self.assertAlmostEqual(point.get_ydata()[0], fatigue["vm_a"][i] / units.scales["stress"])
+                        for number in sim.plt.get_fignums():
+                            sim.plt.figure(number).canvas.draw()
                 finally:
                     sim.plt.close("all")
 

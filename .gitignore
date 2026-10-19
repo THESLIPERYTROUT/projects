@@ -10,3 +10,5 @@ venv
 claude-worktrees/**
 **/darks**/
 **/flats**/
+optics/captures/
+*.fits

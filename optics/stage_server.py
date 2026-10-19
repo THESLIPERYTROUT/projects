@@ -48,13 +48,33 @@ class Lynx:
                 return line.lstrip(">").strip()
         return ""
 
-    def mova(self, units):
-        self.xfer(f"MOVA {float(units):.6f}")
-        deadline = time.time() + MOVE_TIMEOUT_S
+    def mova(self, units, tol=0.0005):
+        """Move and return once the stage has stopped.
+
+        This controller reports MVG as TRUE/FALSE and has been seen reading TRUE
+        while idle, so MVG alone isn't trusted: the move is done when POS is at
+        the target and unchanged for 3 polls, or (fallback) POS has not changed
+        for 10 polls.
+        """
+        target = float(units)
+        self.xfer(f"MOVA {target:.6f}")
+        t0 = time.time()
+        deadline = t0 + MOVE_TIMEOUT_S
+        last, stable = None, 0
         while time.time() < deadline:
-            if self.query("PRINT MVG") == "0":
-                return self.query("PRINT POS")
             time.sleep(0.05)
+            try:
+                pos = float(self.query("PRINT POS"))
+            except ValueError:
+                continue
+            stable = stable + 1 if last is not None and abs(pos - last) < 1e-6 else 0
+            last = pos
+            mvg = self.query("PRINT MVG").upper()
+            at_target = abs(pos - target) < tol
+            if at_target and (stable >= 3 or mvg in ("0", "FALSE")):
+                return f"{pos}"
+            if stable >= 10 and time.time() - t0 > 0.5:
+                return f"{pos}"      # stopped short of target; caller compares
         self.xfer("SSTP")
         raise RuntimeError("motion timeout; soft-stopped")
 

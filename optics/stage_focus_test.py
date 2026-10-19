@@ -241,17 +241,29 @@ class Stage:
     def pos_mm(self):
         return self.pos_units() / self.k
 
-    def _wait_stop(self):
-        deadline = time.time() + self.timeout_s
-        while time.time() < deadline:
-            if self.query("PRINT MVG") == "0":
-                return
+    def _wait_stop(self, target_units=None, tol=0.0005):
+        # MVG on this controller reads TRUE/FALSE and can read TRUE while idle,
+        # so also require position to be stable (same logic as stage_server.py).
+        t0 = time.time()
+        last, stable = None, 0
+        while time.time() < t0 + self.timeout_s:
             time.sleep(0.05)
+            try:
+                pos = float(self.query("PRINT POS"))
+            except ValueError:
+                continue
+            stable = stable + 1 if last is not None and abs(pos - last) < 1e-6 else 0
+            last = pos
+            at_target = target_units is None or abs(pos - target_units) < tol
+            if at_target and (stable >= 3 or self.query("PRINT MVG").upper() in ("0", "FALSE")):
+                return
+            if stable >= 10 and time.time() - t0 > 0.5:
+                return
         raise RuntimeError("stage motion timeout")
 
     def move_abs_mm(self, z_mm, settle_s):
         self._xfer(f"MOVA {z_mm * self.k:.6f}")
-        self._wait_stop()
+        self._wait_stop(z_mm * self.k)
         time.sleep(settle_s)
         return self.pos_mm()
 
@@ -293,7 +305,10 @@ class RemoteStage(Stage):
     def move_abs_mm(self, z_mm, settle_s):
         self._call(op="mova", units=z_mm * self.k)
         time.sleep(settle_s)
-        return self.pos_mm()
+        pos = self.pos_mm()
+        if abs(pos - z_mm) > 0.002:
+            raise RuntimeError(f"stage stopped at {pos:.4f} mm, commanded {z_mm:.4f} mm (limit or stall?)")
+        return pos
 
 
 def open_stage(args):
@@ -320,23 +335,36 @@ def open_camera(args):
     raise SystemExit("camera did not open")
 
 
+class SaturatedError(RuntimeError):
+    pass
+
+
 def grab(cam, n, lo=0.35, hi=0.85, max_exp_ms=50.0):
     """Burst n frames, adjusting exposure so the spot peak sits in [lo, hi] of full scale.
 
     Width does not depend on exposure (background is subtracted), so this only
     keeps SNR high and avoids clipping as the spot grows/shrinks through focus.
     """
-    for _ in range(12):
-        probe = cam.burst(1)[0]
-        peak = int(probe.data.max()) / probe.saturation_value
-        if peak >= 0.98:
-            cam.set_exposure_ms(max(cam.exposure_ms * 0.4, 0.005))
-        elif peak > hi:
-            cam.set_exposure_ms(max(cam.exposure_ms * hi * 0.9 / peak, 0.005))
-        elif peak < lo and cam.exposure_ms < max_exp_ms:
-            cam.set_exposure_ms(min(cam.exposure_ms * 0.6 / max(peak, 0.02), max_exp_ms))
-        else:
-            break
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")          # clamping is handled below
+        for _ in range(12):
+            probe = cam.burst(1)[0]
+            peak = int(probe.data.max()) / probe.saturation_value
+            before = cam.exposure_ms
+            if peak >= 0.98:
+                cam.set_exposure_ms(max(before * 0.4, 0.005))
+                if cam.exposure_ms >= before * 0.99:
+                    raise SaturatedError(
+                        f"spot saturates at the camera's minimum exposure ({before*1000:.1f} us); "
+                        "add ND attenuation in the collimated beam or lower the laser power")
+            elif peak > hi:
+                cam.set_exposure_ms(max(before * hi * 0.9 / peak, 0.005))
+                if cam.exposure_ms >= before * 0.99:
+                    break                        # at minimum exposure but not clipped: accept
+            elif peak < lo and before < max_exp_ms:
+                cam.set_exposure_ms(min(before * 0.6 / max(peak, 0.02), max_exp_ms))
+            else:
+                break
     frames = cam.burst(n)
     return frames, max(int(f.data.max()) for f in frames) / frames[0].saturation_value
 
@@ -560,7 +588,14 @@ def check(args):
     stage.close()
     cam = open_camera(args)
     try:
-        frames, frac = grab(cam, args.frames)
+        try:
+            frames, frac = grab(cam, args.frames)
+        except SaturatedError as exc:
+            print(f"\n*** {exc}")
+            f = cam.snap()
+            f.save_fits("check_frame.fits", imagetyp="LIGHT")
+            print(f"    {f.n_saturated} saturated pixels; saved check_frame.fits")
+            return
         m = measure_frames([f.data for f in frames])
         print(f"peak {frac*100:.0f}% of full scale, exposure {cam.exposure_ms:.4f} ms")
         if m:

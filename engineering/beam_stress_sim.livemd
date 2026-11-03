@@ -1,0 +1,2499 @@
+# Beam Stress Sim
+
+```elixir
+Mix.install([
+  {:toml, "~> 0.7"},
+  {:kino, "~> 0.14"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+## About
+
+Livebook port of `beam_stress_sim.py`: static stress, deflection and infinite-life fatigue for a stepped round shaft on bearings or a fixed support. It reads the same TOML case files from `beam_cases/` (see `gear_shaft_stepped_shaft.toml` for a documented example). The solver works in SI internally; reports and plots follow the case's `[units] system`.
+
+Pick a case below, then evaluate all cells (press `e` then `a` outside a cell). Changing the selection re-runs the case and its report and plots update.
+
+```elixir
+case_files =
+  Path.join(__DIR__, "beam_cases/*.toml")
+  |> Path.wildcard()
+  |> Enum.sort()
+  |> Enum.map(&{&1, Path.basename(&1)})
+
+default_case = Enum.find_value(case_files, fn {path, name} ->
+  if name == "gear_shaft_stepped_shaft.toml", do: path
+end)
+
+case_input = Kino.Input.select("Case file", case_files, default: default_case)
+```
+
+## Units and formatting
+
+Multipliers from case input units to SI. Imperial density is mass density, in lbm/in^3, not weight density. Angles (deg), speed (RPM), Poisson's ratio and factor of safety have the same conventions in both systems.
+
+```elixir
+defmodule Beam.Format do
+  @moduledoc "Compact report numbers without hiding small, nonzero results."
+
+  def number(:infinity), do: "inf"
+
+  def number(value) do
+    value = value * 1.0
+    magnitude = abs(value)
+
+    cond do
+      value == 0 ->
+        "0"
+
+      magnitude < 0.01 or magnitude >= 1.0e7 ->
+        :erlang.float_to_binary(value, [{:scientific, 4}])
+
+      true ->
+        decimals = (5 - floor(:math.log10(magnitude))) |> min(4) |> max(0)
+        formatted = value |> :erlang.float_to_binary([{:decimals, decimals}]) |> commas()
+
+        if decimals > 0 do
+          formatted |> String.trim_trailing("0") |> String.trim_trailing(".")
+        else
+          formatted
+        end
+    end
+  end
+
+  def commas(value) when is_integer(value), do: value |> Integer.to_string() |> commas()
+
+  def commas(text) do
+    case String.split(text, ".") do
+      [whole] -> group(whole)
+      [whole, fraction] -> group(whole) <> "." <> fraction
+    end
+  end
+
+  defp group(whole), do: Regex.replace(~r/\B(?=(\d{3})+$)/, whole, ",")
+
+  # Short form of a float for labels, like Python's :g
+  def short(value) do
+    (value * 1.0) |> Float.to_string() |> String.replace_suffix(".0", "")
+  end
+end
+
+defmodule Beam.Units do
+  @inch_to_m 0.0254
+  @lbm_to_kg 0.45359237
+  @lbf_to_n @lbm_to_kg * 9.80665
+
+  # Multipliers to convert a gear's "power" value to watts, keyed by "power_unit".
+  @power_units %{
+    "W" => 1.0,
+    "kW" => 1.0e3,
+    "MW" => 1.0e6,
+    # mechanical / imperial horsepower
+    "hp" => 745.69987,
+    # metric horsepower
+    "PS" => 735.49875
+  }
+
+  def inch_to_m, do: @inch_to_m
+  def power_units, do: @power_units
+
+  def input("SI") do
+    %{length: 1.0, force: 1.0, moment: 1.0, stress: 1.0, density: 1.0, power_unit: "W"}
+  end
+
+  def input("Imperial") do
+    %{
+      length: @inch_to_m,
+      force: @lbf_to_n,
+      moment: @lbf_to_n * @inch_to_m,
+      stress: @lbf_to_n / (@inch_to_m * @inch_to_m),
+      density: @lbm_to_kg / (@inch_to_m * @inch_to_m * @inch_to_m),
+      power_unit: "hp"
+    }
+  end
+
+  @doc "Scales and labels that convert SI results for display; never used by the solver."
+  def report(system) do
+    units = input(system)
+    imperial = system == "Imperial"
+
+    %{
+      scales: %{
+        length: units.length,
+        diameter: if(imperial, do: units.length, else: 0.001),
+        deflection: if(imperial, do: units.length, else: 0.001),
+        force: units.force,
+        moment: units.moment,
+        stress: if(imperial, do: units.stress, else: 1.0e6),
+        power: @power_units[units.power_unit],
+        angle: 1.0,
+        slope: 1.0,
+        ratio: 1.0
+      },
+      labels: %{
+        length: if(imperial, do: "in", else: "m"),
+        diameter: if(imperial, do: "in", else: "mm"),
+        deflection: if(imperial, do: "in", else: "mm"),
+        force: if(imperial, do: "lbf", else: "N"),
+        moment: if(imperial, do: "lbf*in", else: "N*m"),
+        stress: if(imperial, do: "psi", else: "MPa"),
+        power: units.power_unit,
+        angle: "deg",
+        slope: "rad",
+        ratio: "-"
+      }
+    }
+  end
+
+  def number(_units, :infinity, _quantity), do: "inf"
+  def number(units, value, quantity), do: Beam.Format.number(value / units.scales[quantity])
+
+  def row(units, name, value, quantity) do
+    [name, number(units, value, quantity), units.labels[quantity]]
+  end
+end
+```
+
+## Numerics
+
+Station data lives in plain lists, so the notebook has no native dependencies. An infinite factor of safety is the atom `:infinity`: Erlang orders every number below every atom, so `min/2`, `Enum.min/1` and comparisons against a target all behave as they would for a real infinity.
+
+```elixir
+defmodule Beam.Numeric do
+  def pi, do: :math.pi()
+
+  def hypot(a, b), do: :math.sqrt(a * a + b * b)
+
+  @doc "Same test as numpy.isclose with its default tolerances."
+  def close?(a, b, rtol \\ 1.0e-5, atol \\ 1.0e-8), do: abs(a - b) <= atol + rtol * abs(b)
+
+  def linspace(start, stop, count) do
+    step = (stop - start) / (count - 1)
+    Enum.map(0..(count - 2), &(start + &1 * step)) ++ [stop * 1.0]
+  end
+
+  @doc "Linear interpolation, held at the end values outside the table (numpy.interp)."
+  def interp(x, xs, ys) do
+    pairs = Enum.zip(xs, ys)
+    {x0, y0} = hd(pairs)
+    {x1, y1} = List.last(pairs)
+
+    cond do
+      x <= x0 ->
+        y0
+
+      x >= x1 ->
+        y1
+
+      true ->
+        pairs
+        |> Enum.chunk_every(2, 1, :discard)
+        |> Enum.find_value(fn [{xa, ya}, {xb, yb}] ->
+          if x >= xa and x < xb, do: ya + (yb - ya) / (xb - xa) * (x - xa)
+        end)
+    end
+  end
+
+  @doc "Running trapezoid integral of ys over xs, starting at 0 (same length as xs)."
+  def cumulative_trapezoid(ys, xs) do
+    Enum.zip(xs, ys)
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.scan(0.0, fn [{xa, ya}, {xb, yb}], total -> total + 0.5 * (yb + ya) * (xb - xa) end)
+    |> then(&[0.0 | &1])
+  end
+
+  def argmin(values) do
+    values |> Enum.with_index() |> Enum.min_by(&elem(&1, 0)) |> elem(1)
+  end
+
+  def argmax(values) do
+    values |> Enum.with_index() |> Enum.max_by(&elem(&1, 0)) |> elem(1)
+  end
+
+  @doc """
+  Solve A x = b by Gaussian elimination with partial pivoting. A may have more
+  rows than columns; the caller checks that the extra rows are satisfied.
+  Returns {:ok, x}, or :rank_deficient when the columns are not independent.
+  """
+  def solve_linear(rows, rhs) do
+    columns = rows |> hd() |> length()
+    largest = rows |> List.flatten() |> Enum.map(&abs/1) |> Enum.max()
+    augmented = Enum.zip_with(rows, rhs, fn row, b -> Enum.map(row ++ [b], &(&1 * 1.0)) end)
+
+    case eliminate(augmented, 0, columns, 1.0e-13 * largest, []) do
+      nil -> :rank_deficient
+      pivots -> {:ok, back_substitute(pivots, columns - 1, [])}
+    end
+  end
+
+  defp eliminate(_rows, column, columns, _tolerance, pivots) when column == columns, do: pivots
+
+  defp eliminate(rows, column, columns, tolerance, pivots) do
+    pivot = Enum.max_by(rows, &abs(Enum.at(&1, column)), fn -> nil end)
+
+    if pivot == nil or abs(Enum.at(pivot, column)) <= tolerance do
+      nil
+    else
+      lead = Enum.at(pivot, column)
+
+      reduced =
+        rows
+        |> List.delete(pivot)
+        |> Enum.map(fn row ->
+          factor = Enum.at(row, column) / lead
+          Enum.zip_with(row, pivot, fn a, b -> a - factor * b end)
+        end)
+
+      eliminate(reduced, column + 1, columns, tolerance, [pivot | pivots])
+    end
+  end
+
+  defp back_substitute([], _column, solution), do: solution
+
+  defp back_substitute([pivot | rest], column, solution) do
+    {coefficients, [b]} = Enum.split(pivot, -1)
+    known = coefficients |> Enum.drop(column + 1) |> Enum.zip(solution)
+    remainder = Enum.reduce(known, b, fn {a, x}, total -> total - a * x end)
+    back_substitute(rest, column - 1, [remainder / Enum.at(coefficients, column) | solution])
+  end
+end
+```
+
+## Loading a case
+
+All case settings (beam, material, supports, geometry, loads) live in a TOML case file so different sim cases can be saved independently of this notebook. Every dimensional input is converted to SI here and validated, with the same rules as the Python version.
+
+```elixir
+defmodule Beam.Case do
+  alias Beam.Numeric
+  alias Beam.Units
+
+  # Unit vectors from the modeled shaft toward the mating external spur gear.
+  # +x runs along the shaft. Viewed from the +x end toward the origin, with
+  # +y up, +z points left: top = +y, bottom = -y, left = +z, right = -z.
+  @mesh_directions %{
+    "top" => {1.0, 0.0},
+    "right" => {0.0, -1.0},
+    "bottom" => {-1.0, 0.0},
+    "left" => {0.0, 1.0}
+  }
+
+  @criteria ["goodman", "gerber", "asme-elliptic", "soderberg"]
+  @finishes ["ground", "machined", "cold-drawn", "hot-rolled", "as-forged"]
+  @fatigue_keys ~w(criterion surface_finish reliability temperature endurance_limit torque_alternating_fraction)
+
+  def mesh_direction(orientation), do: @mesh_directions[orientation]
+
+  def load(path) do
+    raw = path |> File.read!() |> Toml.decode!()
+
+    units_config = Map.get(raw, "units", %{})
+    is_map(units_config) || fail(~s(Use [units] with system = "SI" or "Imperial"))
+
+    unit_system =
+      case normalized(Map.get(units_config, "system", "SI")) do
+        "si" -> "SI"
+        "imperial" -> "Imperial"
+        _ -> fail(~s([units] system must be "SI" or "Imperial"))
+      end
+
+    units = Units.input(unit_system)
+
+    for section <- ~w(beam material supports geometry loads), not Map.has_key?(raw, section) do
+      fail("Config file #{path} is missing required section [#{section}]")
+    end
+
+    beam = raw["beam"]
+    length = number(required(beam, "length", "beam")) * units.length
+    mesh = number(required(beam, "mesh_density_factor", "beam")) * units.length
+    (length > 0 and mesh > 0) || fail("[beam] length and mesh_density_factor must be positive")
+
+    material = raw["material"]
+
+    material_properties = %{
+      young_modulus: number(required(material, "young_modulus", "material")) * units.stress,
+      poisson_ratio: number(Map.get(material, "poisson_ratio", 0.3)),
+      density:
+        if(Map.has_key?(material, "density"),
+          do: number(material["density"]) * units.density,
+          else: 7850.0
+        )
+    }
+
+    yield_strength = number(required(material, "yield_strength", "material")) * units.stress
+
+    ultimate_strength =
+      if Map.has_key?(material, "ultimate_strength") do
+        number(material["ultimate_strength"]) * units.stress
+      end
+
+    if ultimate_strength != nil and ultimate_strength < yield_strength do
+      fail("[material] ultimate_strength must be at least yield_strength")
+    end
+
+    target = raw |> Map.get("design", %{}) |> Map.get("target_factor_of_safety", 2)
+
+    fatigue =
+      if Map.has_key?(raw, "fatigue") do
+        fatigue_settings(raw["fatigue"], unit_system, ultimate_strength)
+      end
+
+    supports =
+      Enum.map(raw["supports"], fn support ->
+        %{
+          position: number(required(support, "position", "supports")) * units.length,
+          type: required(support, "type", "supports")
+        }
+      end)
+
+    geometry = geometry(raw["geometry"], units, length)
+    loads = Enum.map(raw["loads"], &load_entry(&1, units))
+
+    for item <- supports ++ loads, item.position < 0 or item.position > length do
+      fail("Position #{item.position} is outside the beam [0, #{length}]")
+    end
+
+    %{
+      case_path: path,
+      unit_system: unit_system,
+      length: length,
+      mesh_density_factor: mesh,
+      simulated_points: trunc(length / mesh),
+      supports: supports,
+      material_properties: material_properties,
+      yield_strength: yield_strength,
+      ultimate_strength: ultimate_strength,
+      target_factor_of_safety: target,
+      fatigue: fatigue,
+      geometry: geometry,
+      loads: loads
+    }
+  end
+
+  defp fatigue_settings(table, unit_system, ultimate_strength) do
+    is_map(table) || fail("Use a [fatigue] table for fatigue settings")
+    unknown = Map.keys(table) -- @fatigue_keys
+
+    if unknown != [] do
+      fail(
+        "[fatigue] has unknown key(s): #{unknown |> Enum.sort() |> Enum.join(", ")} " <>
+          "(expected #{@fatigue_keys |> Enum.sort() |> Enum.join(", ")})"
+      )
+    end
+
+    ultimate_strength != nil || fail("[fatigue] requires [material] ultimate_strength")
+
+    criterion = normalized(Map.get(table, "criterion", "goodman"))
+
+    criterion in @criteria ||
+      fail("[fatigue] criterion must be one of #{Enum.join(@criteria, ", ")}")
+
+    finish = normalized(Map.get(table, "surface_finish", "machined"))
+
+    finish in @finishes ||
+      fail("[fatigue] surface_finish must be one of #{Enum.join(@finishes, ", ")}")
+
+    reliability = number(Map.get(table, "reliability", 0.5))
+
+    (reliability >= 0.5 and reliability < 1) ||
+      fail("[fatigue] reliability must be in [0.5, 1)")
+
+    temperature = if Map.has_key?(table, "temperature"), do: number(table["temperature"])
+
+    temperature_f =
+      cond do
+        temperature == nil -> nil
+        unit_system == "Imperial" -> temperature
+        true -> temperature * 9 / 5 + 32
+      end
+
+    if temperature_f != nil and temperature_f > 1000 do
+      fail(
+        "[fatigue] temperature must be at most 1000 F / 538 C " <>
+          "(limit of the Marin temperature factor fit)"
+      )
+    end
+
+    endurance_limit =
+      if Map.has_key?(table, "endurance_limit") do
+        number(table["endurance_limit"]) * Units.input(unit_system).stress
+      end
+
+    if endurance_limit != nil and endurance_limit <= 0 do
+      fail("[fatigue] endurance_limit must be positive")
+    end
+
+    torque_fraction = number(Map.get(table, "torque_alternating_fraction", 0.0))
+
+    torque_fraction >= 0 ||
+      fail("[fatigue] torque_alternating_fraction must be nonnegative")
+
+    %{
+      criterion: criterion,
+      surface_finish: finish,
+      reliability: reliability,
+      # as written, deg F (Imperial) or deg C (SI)
+      temperature: temperature,
+      temperature_f: temperature_f,
+      endurance_limit: endurance_limit,
+      torque_alternating_fraction: torque_fraction
+    }
+  end
+
+  defp geometry(raw_segments, units, length) do
+    geometry =
+      raw_segments
+      |> Enum.sort_by(&required(&1, "start", "geometry"))
+      |> Enum.map(&segment(&1, units))
+
+    Numeric.close?(hd(geometry).start, 0.0) || fail("First [[geometry]] segment must start at 0")
+
+    Numeric.close?(List.last(geometry).stop, length) ||
+      fail("Last [[geometry]] segment must end at the beam length (#{length})")
+
+    for [a, b] <- Enum.chunk_every(geometry, 2, 1, :discard), not Numeric.close?(a.stop, b.start) do
+      fail("[[geometry]] segments are not contiguous at x=#{a.stop} / #{b.start}")
+    end
+
+    if Enum.any?([:fillet_radius, :kf, :kfs], &Map.has_key?(hd(geometry), &1)) do
+      fail(
+        "[[geometry]] fillet_radius / kf / kfs describe the shoulder at a segment's " <>
+          "start, so they cannot be set on the first segment"
+      )
+    end
+
+    geometry
+  end
+
+  defp segment(raw, units) do
+    d = number(required(raw, "diameter", "geometry")) * units.length
+
+    %{
+      start: number(required(raw, "start", "geometry")) * units.length,
+      stop: number(required(raw, "end", "geometry")) * units.length,
+      diameter: d,
+      # Cross-section properties
+      i: Numeric.pi() * :math.pow(d, 4) / 64,
+      j: Numeric.pi() * :math.pow(d, 4) / 32,
+      a: Numeric.pi() * d * d / 4,
+      c: d / 2
+    }
+    |> shoulder(raw, units)
+  end
+
+  # Optional shoulder details at this segment's start (fatigue only).
+  defp shoulder(segment, raw, units) do
+    segment =
+      if Map.has_key?(raw, "fillet_radius") do
+        radius = number(raw["fillet_radius"]) * units.length
+        radius > 0 || fail("[[geometry]] fillet_radius must be positive")
+        Map.put(segment, :fillet_radius, radius)
+      else
+        segment
+      end
+
+    Enum.reduce([kf: "kf", kfs: "kfs"], segment, fn {key, name}, acc ->
+      if Map.has_key?(raw, name) do
+        value = number(raw[name])
+        value >= 1 || fail("[[geometry]] #{name} must be at least 1")
+        Map.put(acc, key, value)
+      else
+        acc
+      end
+    end)
+  end
+
+  defp load_entry(raw, units) do
+    type = required(raw, "type", "loads")
+    position = number(required(raw, "position", "loads")) * units.length
+
+    force = raw |> Map.get("force", [0, 0, 0]) |> Enum.map(&(number(&1) * units.force))
+    moment = raw |> Map.get("moment", [0, 0, 0]) |> Enum.map(&(number(&1) * units.moment))
+
+    if length(force) != 3 or length(moment) != 3 do
+      fail("Load at x=#{position}: force/moment must have 3 components")
+    end
+
+    %{type: type, position: position, force: force, moment: moment}
+    |> gear_fields(raw, units)
+    |> driving_gear_fields(raw, units)
+  end
+
+  defp gear_fields(%{type: type} = load, raw, units) when type in ["driving gear", "driven gear"] do
+    diameter = number(required(raw, "diameter", "loads")) * units.length
+    orientation = normalized(required(raw, "meshing orientation", "loads"))
+
+    Map.has_key?(@mesh_directions, orientation) ||
+      fail("[loads] meshing orientation must be top, right, bottom, or left")
+
+    tooth_angle = number(required(raw, "tooth_angle", "loads"))
+    diameter > 0 || fail("[loads] gear diameter must be positive and finite")
+
+    (tooth_angle > 0 and tooth_angle < 90) ||
+      fail("[loads] tooth_angle is the pressure angle and must be between 0 and 90 degrees")
+
+    Map.merge(load, %{diameter: diameter, orientation: orientation, tooth_angle: tooth_angle})
+  end
+
+  defp gear_fields(load, _raw, _units), do: load
+
+  defp driving_gear_fields(%{type: "driving gear"} = load, raw, units) do
+    unit = to_string(Map.get(raw, "power_unit", units.power_unit))
+
+    Map.has_key?(Units.power_units(), unit) ||
+      fail(
+        "Load at x=#{load.position}: unknown power_unit '#{unit}' " <>
+          "(choose from #{Units.power_units() |> Map.keys() |> Enum.join(", ")})"
+      )
+
+    # Solver works in W
+    power = number(required(raw, "power", "loads")) * Units.power_units()[unit]
+    speed = number(required(raw, "speed", "loads"))
+    power >= 0 || fail("[loads] gear power must be nonnegative and finite")
+    speed > 0 || fail("[loads] gear speed must be positive and finite (RPM magnitude)")
+    Map.merge(load, %{power_unit: unit, power: power, speed: speed})
+  end
+
+  defp driving_gear_fields(load, _raw, _units), do: load
+
+  defp required(table, key, section) do
+    case Map.fetch(table, key) do
+      {:ok, value} -> value
+      :error -> fail("Config section [#{section}] is missing required key '#{key}'")
+    end
+  end
+
+  defp normalized(value), do: value |> to_string() |> String.trim() |> String.downcase()
+  defp number(value) when is_number(value), do: value * 1.0
+  defp fail(message), do: raise(ArgumentError, message)
+end
+```
+
+## Statics and internal loads
+
+Reactions come from equilibrium and are injected back as point loads, so the singularity engine treats everything uniformly. A point force contributes $\langle x-a \rangle^0$ to shear and $\langle x-a \rangle^1$ to moment; a point moment contributes $\langle x-a \rangle^0$ to moment. Slope and deflection integrate $M/EI$ with the trapezoid rule, with constants set by the supports.
+
+```elixir
+defmodule Beam.Solver do
+  alias Beam.Numeric
+
+  @doc """
+  Index of the geometry segment containing x. At a shoulder (x exactly on a
+  segment boundary) the smaller-diameter segment is chosen, since it carries
+  the higher stress.
+  """
+  def section_index(x, geometry) do
+    first = hd(geometry)
+    last = List.last(geometry)
+
+    if x < first.start or x > last.stop do
+      raise ArgumentError, "x=#{x} is outside the beam geometry [#{first.start}, #{last.stop}]"
+    end
+
+    index = Enum.find_index(geometry, &(&1.stop >= x))
+    segment = Enum.at(geometry, index)
+    next = Enum.at(geometry, index + 1)
+    if next != nil and x == segment.stop and next.diameter < segment.diameter, do: index + 1, else: index
+  end
+
+  def section_at(x, geometry), do: Enum.at(geometry, section_index(x, geometry))
+
+  @doc "A segment boundary is a stress raiser if the diameter steps or kf/kfs/fillet is given."
+  def stress_raiser?(previous, segment) do
+    not Numeric.close?(previous.diameter, segment.diameter) or
+      Enum.any?([:fillet_radius, :kf, :kfs], &Map.has_key?(segment, &1))
+  end
+
+  def stress_raiser_positions(geometry) do
+    for [a, b] <- Enum.chunk_every(geometry, 2, 1, :discard), stress_raiser?(a, b), do: b.start
+  end
+
+  @doc "Evenly spaced stations plus every stress raiser, so steps are always evaluated."
+  def build_stations(length, count, geometry) do
+    (Numeric.linspace(0.0, length, count) ++ stress_raiser_positions(geometry))
+    |> Enum.sort()
+    |> Enum.dedup()
+  end
+
+  @doc """
+  Solve the reactions. Returns {applied, reactions}: `applied` is the case's
+  loads with gear forces filled in, `reactions` one point load per unknown.
+  """
+  def build_loads(loads, supports) do
+    driving_gear = Enum.find(loads, &(&1.type == "driving gear"))
+    applied = Enum.map(loads, &resolve_load(&1, driving_gear))
+    {rows, unknowns} = statics_matrix(supports)
+    b = statics_rhs(applied)
+
+    reactions =
+      case Numeric.solve_linear(rows, b) do
+        {:ok, solution} -> solution
+        :rank_deficient -> raise ArgumentError, "The system is statically indeterminate or has insufficient supports to solve for reactions."
+      end
+
+    consistent =
+      Enum.zip(rows, b)
+      |> Enum.all?(fn {row, target} ->
+        value = row |> Enum.zip(reactions) |> Enum.map(fn {a, x} -> a * x end) |> Enum.sum()
+        Numeric.close?(value, target, 1.0e-8, 1.0e-8)
+      end)
+
+    consistent || raise ArgumentError, "Support configuration is unstable or incompatible with the applied loads."
+    {applied, Enum.zip_with(reactions, unknowns, &reaction_load/2)}
+  end
+
+  defp resolve_load(%{type: type} = load, driving_gear) when type in ["driving gear", "driven gear"] do
+    driving_gear != nil ||
+      raise ArgumentError, "A 'driven gear' load requires a 'driving gear' load to supply shaft power/speed."
+
+    d = load.diameter
+    wt = 60 * driving_gear.power / (d * Numeric.pi() * driving_gear.speed)
+    wr = wt * :math.tan(load.tooth_angle * Numeric.pi() / 180)
+    {ny, nz} = Beam.Case.mesh_direction(load.orientation)
+    # Preserve the solver's torque convention: driving gear adds +Mx, driven
+    # gear removes it (-Mx). For an external mesh the radial force is -Wr*n,
+    # and the +Mx tangential direction is x_hat cross n.
+    sign = if type == "driving gear", do: 1, else: -1
+
+    %{
+      load
+      | force: [0.0, -wr * ny - sign * wt * nz, -wr * nz + sign * wt * ny],
+        # Transfer the contact force to the shaft centerline with its
+        # equivalent couple: Mx = r_y*Fz - r_z*Fy = sign * radius * Wt.
+        moment: [sign * (d / 2) * wt, 0.0, 0.0]
+    }
+  end
+
+  defp resolve_load(%{type: type} = load, _driving_gear) when type in ["point load", "point moment"] do
+    load
+  end
+
+  defp resolve_load(load, _driving_gear) do
+    raise ArgumentError, "Load type '#{load.type}' not implemented"
+  end
+
+  defp statics_matrix(supports) do
+    columns =
+      Enum.flat_map(supports, fn
+        %{type: "bearing", position: d} ->
+          [{"Fy", d, [0, 1, 0, 0, 0, d]}, {"Fz", d, [0, 0, 1, 0, -d, 0]}]
+
+        %{type: "fixed", position: d} ->
+          [
+            {"Fx", d, [1, 0, 0, 0, 0, 0]},
+            {"Fy", d, [0, 1, 0, 0, 0, d]},
+            {"Fz", d, [0, 0, 1, 0, -d, 0]},
+            {"Mx", d, [0, 0, 0, 1, 0, 0]},
+            {"My", d, [0, 0, 0, 0, 1, 0]},
+            {"Mz", d, [0, 0, 0, 0, 0, 1]}
+          ]
+
+        support ->
+          raise ArgumentError, "Support type '#{support.type}' not implemented"
+      end)
+
+    rows = columns |> Enum.map(&elem(&1, 2)) |> Enum.zip() |> Enum.map(&Tuple.to_list/1)
+    {rows, Enum.map(columns, fn {dof, position, _} -> {dof, position} end)}
+  end
+
+  defp statics_rhs(loads) do
+    equilibrium(loads) |> Enum.map(fn {_name, value} -> -value end)
+  end
+
+  defp equilibrium(loads) do
+    [
+      {"sum_fx", sum(loads, fn %{force: [fx, _, _]} -> fx end)},
+      {"sum_fy", sum(loads, fn %{force: [_, fy, _]} -> fy end)},
+      {"sum_fz", sum(loads, fn %{force: [_, _, fz]} -> fz end)},
+      {"sum_mx", sum(loads, fn %{moment: [mx, _, _]} -> mx end)},
+      {"sum_my", sum(loads, fn %{moment: [_, my, _], force: [_, _, fz], position: x} -> my - fz * x end)},
+      {"sum_mz", sum(loads, fn %{moment: [_, _, mz], force: [_, fy, _], position: x} -> mz + fy * x end)}
+    ]
+  end
+
+  defp sum(loads, value), do: loads |> Enum.map(value) |> Enum.sum()
+
+  defp reaction_load(value, {dof, position}) do
+    component = fn name -> if dof == name, do: value, else: 0.0 end
+
+    %{
+      type: "reaction",
+      position: position,
+      force: [component.("Fx"), component.("Fy"), component.("Fz")],
+      moment: [component.("Mx"), component.("My"), component.("Mz")]
+    }
+  end
+
+  def validate_equilibrium(all_loads, tolerance \\ 1.0e-6) do
+    residuals = equilibrium(all_loads)
+
+    if Enum.any?(residuals, fn {_name, value} -> abs(value) > tolerance end) do
+      raise ArgumentError, "Global equilibrium check failed: #{inspect(residuals)}"
+    end
+
+    residuals
+  end
+
+  def internal_loads(xs, all_loads) do
+    zero = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}
+
+    rows =
+      Enum.map(xs, fn x ->
+        Enum.reduce(all_loads, zero, fn load, totals ->
+          if x >= load.position, do: add_load(totals, load, x), else: totals
+        end)
+      end)
+
+    [:v_y, :v_z, :m_y, :m_z, :t, :n]
+    |> Enum.with_index()
+    |> Map.new(fn {key, index} -> {key, Enum.map(rows, &elem(&1, index))} end)
+  end
+
+  defp add_load({v_y, v_z, m_y, m_z, t, n}, load, x) do
+    [fx, fy, fz] = load.force
+    [mx, my, mz] = load.moment
+    ramp = x - load.position
+
+    # Applied couples: sign convention matches the statics solver (sum Mz =
+    # Mz + Fy*x, sum My = My - Fz*x) with M_z' = V_y and M_y' = V_z, so a
+    # z-couple enters with the opposite sign to a force's moment.
+    {v_y + fy, v_z + fz, m_y + fz * ramp + my, m_z + fy * ramp - mz, t + mx, n + fx}
+  end
+
+  def deflection(xs, results, geometry, material, supports) do
+    ei = Enum.map(xs, &(section_at(&1, geometry).i * material.young_modulus))
+    integrate = fn moment ->
+      theta = moment |> Enum.zip_with(ei, &(&1 / &2)) |> Numeric.cumulative_trapezoid(xs)
+      {theta, Numeric.cumulative_trapezoid(theta, xs)}
+    end
+
+    {theta_y_raw, delta_y_raw} = integrate.(results.m_z)
+    {theta_z_raw, delta_z_raw} = integrate.(results.m_y)
+
+    # Boundary conditions come from the supports:
+    #   theta(x) = theta_raw(x) + C1
+    #   delta(x) = delta_raw(x) + C1*x + C2
+    # Every support pins delta = 0 at its position; a fixed support also pins
+    # theta = 0. Supports that reach this point give exactly two conditions.
+    constants = fn theta_raw, delta_raw ->
+      conditions =
+        Enum.flat_map(supports, fn support ->
+          pin = {[support.position, 1], -Numeric.interp(support.position, xs, delta_raw)}
+
+          if support.type == "fixed" do
+            [pin, {[1, 0], -Numeric.interp(support.position, xs, theta_raw)}]
+          else
+            [pin]
+          end
+        end)
+
+      {rows, b} = Enum.unzip(conditions)
+
+      case Numeric.solve_linear(rows, b) do
+        {:ok, [c1, c2]} -> {c1, c2}
+        :rank_deficient -> raise ArgumentError, "Supports do not constrain the deflection curve (need two bearings or one fixed support)."
+      end
+    end
+
+    {c1_y, c2_y} = constants.(theta_y_raw, delta_y_raw)
+    {c1_z, c2_z} = constants.(theta_z_raw, delta_z_raw)
+
+    %{
+      theta_y: Enum.map(theta_y_raw, &(&1 + c1_y)),
+      theta_z: Enum.map(theta_z_raw, &(&1 + c1_z)),
+      delta_y: Enum.zip_with(delta_y_raw, xs, &(&1 + c1_y * &2 + c2_y)),
+      delta_z: Enum.zip_with(delta_z_raw, xs, &(&1 + c1_z * &2 + c2_z))
+    }
+  end
+
+  def stresses(xs, results, geometry) do
+    [xs, results.m_y, results.m_z, results.n, results.t]
+    |> Enum.zip()
+    |> Enum.map(fn {x, m_y, m_z, n, t} ->
+      section = section_at(x, geometry)
+      sigma = Numeric.hypot(m_y, m_z) * section.c / section.i + n / section.a
+      tau = t * section.c / section.j
+      {sigma, tau, :math.sqrt(sigma * sigma + 3 * tau * tau)}
+    end)
+    |> then(fn rows ->
+      %{
+        sigma: Enum.map(rows, &elem(&1, 0)),
+        tau: Enum.map(rows, &elem(&1, 1)),
+        von_mises: Enum.map(rows, &elem(&1, 2))
+      }
+    end)
+  end
+
+  @doc "Plane stress properties for sigma_y = 0, angle in degrees."
+  def principal_stresses(sigma_x, tau_xy) do
+    center = sigma_x / 2
+    radius = Numeric.hypot(center, tau_xy)
+
+    %{
+      center: center,
+      radius: radius,
+      sigma_1: center + radius,
+      sigma_2: center - radius,
+      theta_p: 0.5 * :math.atan2(tau_xy, center) * 180 / Numeric.pi()
+    }
+  end
+
+  @doc "Normal, shear and von Mises stress over a grid of the critical cross section."
+  def section_grid(x, index, results, geometry, count \\ 300) do
+    section = section_at(x, geometry)
+    %{i: i, j: j, a: a, c: c} = section
+    [m_y, m_z, t, n] = Enum.map([:m_y, :m_z, :t, :n], &Enum.at(results[&1], index))
+    coords = Numeric.linspace(-c, c, count)
+
+    for z <- coords, y <- coords, y * y + z * z <= c * c do
+      sigma = n / a + m_z * y / i + m_y * z / i
+      tau = t * :math.sqrt(y * y + z * z) / j
+      %{y: y, z: z, sigma: sigma, tau: tau, von_mises: :math.sqrt(sigma * sigma + 3 * tau * tau)}
+    end
+  end
+
+  def required_diameter_msst(m, t, sy, n) do
+    :math.pow(32 * n / (Numeric.pi() * sy) * :math.sqrt(m * m + t * t), 1 / 3)
+  end
+end
+```
+
+## Fatigue
+
+Infinite life, rotating shaft, Shigley ch. 6-7 approach: bending is fully reversed by rotation, torque and axial load are mean, with an optional alternating torque fraction. $K_f$ and $K_{fs}$ act at stress raisers.
+
+```elixir
+defmodule Beam.Fatigue do
+  alias Beam.Numeric
+  alias Beam.Solver
+
+  @criteria [
+    {"goodman", "Modified Goodman"},
+    {"gerber", "Gerber"},
+    {"asme-elliptic", "ASME elliptic"},
+    {"soderberg", "Soderberg"}
+  ]
+
+  # Marin surface factor ka = a * Sut^b with Sut in MPa (Shigley Table 6-2).
+  @surface_finish %{
+    "ground" => {1.58, -0.085},
+    "machined" => {4.51, -0.265},
+    "cold-drawn" => {4.51, -0.265},
+    "hot-rolled" => {57.7, -0.718},
+    "as-forged" => {272.0, -0.995}
+  }
+
+  # Shoulder-fillet stress concentration of a stepped round shaft,
+  # Kt = A * (r/d)^b, tabulated by D/d. Power-law fits to Peterson's charts
+  # (Norton, Machine Design, App. C; cf. Shigley Figs A-15-8 / A-15-9).
+  @kt_bending [
+    {1.01, 0.91938, -0.17032},
+    {1.02, 0.96048, -0.17711},
+    {1.03, 0.98061, -0.18381},
+    {1.05, 0.98137, -0.19653},
+    {1.07, 0.97527, -0.20958},
+    {1.10, 0.95120, -0.23757},
+    {1.20, 0.97098, -0.21796},
+    {1.50, 0.93836, -0.25759},
+    {2.00, 0.90879, -0.28598},
+    {3.00, 0.89334, -0.30860},
+    {6.00, 0.87868, -0.33243}
+  ]
+  @kt_torsion [
+    {1.09, 0.90337, -0.12692},
+    {1.20, 0.83425, -0.21649},
+    {1.33, 0.84897, -0.23161},
+    {2.00, 0.86331, -0.23865}
+  ]
+
+  # Fillet radius assumed for a shoulder with no fillet_radius / kf given:
+  # a sharp fillet, r/d = 0.02 (Shigley Table 7-1 first-iteration estimate).
+  @default_fillet_ratio 0.02
+  # r/d range covered by the Peterson charts behind the Kt fits above.
+  @kt_fit_low 0.01
+  @kt_fit_high 0.3
+
+  def criteria, do: @criteria
+  def criterion_name(criterion), do: List.keyfind!(@criteria, criterion, 0) |> elem(1)
+  def default_fillet_ratio, do: @default_fillet_ratio
+
+  @doc "Geometric stress concentration Kt for a shoulder fillet (stepped round shaft)."
+  def shoulder_kt(big, small, r, table) do
+    ratios = Enum.map(table, &elem(&1, 0))
+    coefficient = Enum.map(table, &elem(&1, 1))
+    exponent = Enum.map(table, &elem(&1, 2))
+    ratio = big / small
+    # Inside the table interpolate the fit coefficients; above it use the
+    # largest D/d row; below it blend linearly to Kt = 1 at D/d = 1.
+    kt = Numeric.interp(ratio, ratios, coefficient) * :math.pow(r / small, Numeric.interp(ratio, ratios, exponent))
+    first = hd(ratios)
+    kt = if ratio < first, do: 1 + (kt - 1) * max(ratio - 1, 0.0) / (first - 1), else: kt
+    max(kt, 1.0)
+  end
+
+  @doc "Neuber notch sensitivity q (Shigley eqs 6-34, 6-35a/b), r in m, Sut in Pa."
+  def notch_sensitivity(r, ultimate_strength, torsion \\ false) do
+    # The Neuber constant fit is valid for 50-250 kpsi. Clamping Sut low keeps
+    # sqrt(a) from turning negative; clamping it high raises q (conservative).
+    sut = (ultimate_strength / (1.0e3 * Beam.Units.input("Imperial").stress)) |> max(50.0) |> min(250.0)
+    first = if torsion, do: 0.190 - 2.51e-3 * sut, else: 0.246 - 3.08e-3 * sut
+    second = if torsion, do: 1.35e-5, else: 1.51e-5
+    sqrt_a = first + second * sut * sut - 2.67e-8 * sut * sut * sut
+    1 / (1 + sqrt_a / :math.sqrt(r / Beam.Units.inch_to_m()))
+  end
+
+  @doc "Kt, q and Kf (bending) / Kts, qs and Kfs (torsion) at each stress raiser."
+  def stress_raisers(geometry, ultimate_strength) do
+    for [previous, segment] <- Enum.chunk_every(geometry, 2, 1, :discard),
+        Solver.stress_raiser?(previous, segment) do
+      [d, big] = Enum.sort([previous.diameter, segment.diameter])
+      r = Map.get(segment, :fillet_radius, @default_fillet_ratio * d)
+      kt = shoulder_kt(big, d, r, @kt_bending)
+      kts = shoulder_kt(big, d, r, @kt_torsion)
+      q = notch_sensitivity(r, ultimate_strength)
+      qs = notch_sensitivity(r, ultimate_strength, true)
+      overridden = Map.has_key?(segment, :kf) and Map.has_key?(segment, :kfs)
+
+      # Outside the charted r/d range the power-law fit is extrapolated; for
+      # large r/d it drops toward Kt = 1 and the shoulder silently stops
+      # counting, which is how a units slip (in vs mm) would show up.
+      warnings =
+        if not overridden and (r / d < @kt_fit_low or r / d > @kt_fit_high) do
+          [
+            "r/d = #{Beam.Format.number(r / d)} is outside the Kt fit range " <>
+              "#{@kt_fit_low}-#{@kt_fit_high}; check fillet_radius units or set kf/kfs"
+          ]
+        else
+          []
+        end
+
+      %{
+        position: segment.start,
+        d: d,
+        big_d: big,
+        r: r,
+        r_assumed: not Map.has_key?(segment, :fillet_radius),
+        kt: kt,
+        kts: kts,
+        q: q,
+        qs: qs,
+        kf: Map.get(segment, :kf, 1 + q * (kt - 1)),
+        kfs: Map.get(segment, :kfs, 1 + qs * (kts - 1)),
+        override: Map.has_key?(segment, :kf) or Map.has_key?(segment, :kfs),
+        warnings: warnings
+      }
+    end
+  end
+
+  @doc "Marin factors that do not depend on diameter."
+  def marin_constants(ultimate_strength, fatigue) do
+    sut_mpa = ultimate_strength / 1.0e6
+    {a, b} = @surface_finish[fatigue.surface_finish]
+    t = fatigue.temperature_f
+
+    kd =
+      if t == nil or t <= 70 do
+        1.0
+      else
+        0.975 + 0.432e-3 * t - 0.115e-5 * t ** 2 + 0.104e-8 * t ** 3 - 0.595e-12 * t ** 4
+      end
+
+    se_prime =
+      cond do
+        fatigue.endurance_limit != nil -> fatigue.endurance_limit
+        sut_mpa <= 1400 -> 0.5 * ultimate_strength
+        true -> 700.0e6
+      end
+
+    %{
+      ka: a * :math.pow(sut_mpa, b),
+      # bending; torsion enters through von Mises, not kc
+      kc: 1.0,
+      kd: kd,
+      ke: 1 - 0.08 * normal_quantile(fatigue.reliability),
+      se_prime: se_prime
+    }
+  end
+
+  # Inverse standard normal CDF for p in [0.5, 1), by bisection on erfc.
+  defp normal_quantile(p) do
+    Enum.reduce(1..120, {0.0, 40.0}, fn _, {low, high} ->
+      middle = (low + high) / 2
+      if 0.5 * :math.erfc(middle / :math.sqrt(2)) <= 1 - p, do: {low, middle}, else: {middle, high}
+    end)
+    |> elem(0)
+  end
+
+  @doc "Size factor for rotating round sections; outside 2.79-254 mm the fit is held at its end values."
+  def size_factor(d) do
+    d_mm = (d * 1.0e3) |> max(2.79) |> min(254.0)
+    if d_mm <= 51, do: 1.24 * :math.pow(d_mm, -0.107), else: 1.51 * :math.pow(d_mm, -0.157)
+  end
+
+  def endurance_limit(d, marin) do
+    marin.ka * size_factor(d) * marin.kc * marin.kd * marin.ke * marin.se_prime
+  end
+
+  @doc "Alternating/mean stress components (Pa) for a rotating round shaft."
+  def stress_state(d, m, t, n, kf, kfs, torque_fraction) do
+    d3 = :math.pow(d, 3)
+    # fully reversed bending
+    sigma_a = kf * 32 * m / (Numeric.pi() * d3)
+    # steady axial (sign ignored: conservative)
+    sigma_m = kf * 4 * abs(n) / (Numeric.pi() * d * d)
+    tau_m = kfs * 16 * abs(t) / (Numeric.pi() * d3)
+    tau_a = torque_fraction * tau_m
+
+    %{
+      sigma_a: sigma_a,
+      sigma_m: sigma_m,
+      tau_a: tau_a,
+      tau_m: tau_m,
+      vm_a: :math.sqrt(sigma_a * sigma_a + 3 * tau_a * tau_a),
+      vm_m: :math.sqrt(sigma_m * sigma_m + 3 * tau_m * tau_m),
+      vm_max: :math.sqrt((sigma_a + sigma_m) ** 2 + 3 * (tau_a + tau_m) ** 2)
+    }
+  end
+
+  @doc "Infinite-life factor of safety from von Mises alternating/mean stress."
+  def fos("gerber", vm_a, vm_m, se, sut, _sy) do
+    # n = (Sut^2 sa / 2 sm^2 Se)(-1 + sqrt(1 + (2 sm Se / Sut sa)^2)), written
+    # in a form that stays finite for sa -> 0 (n -> Sut/sm) and sm -> 0 (n -> Se/sa).
+    denominator = vm_a + Numeric.hypot(vm_a, 2 * vm_m * se / sut)
+    if denominator > 0, do: 2 * se / denominator, else: :infinity
+  end
+
+  def fos("goodman", vm_a, vm_m, se, sut, _sy), do: invert(vm_a / se + vm_m / sut)
+  def fos("soderberg", vm_a, vm_m, se, _sut, sy), do: invert(vm_a / se + vm_m / sy)
+  def fos("asme-elliptic", vm_a, vm_m, se, _sut, sy), do: invert(Numeric.hypot(vm_a / se, vm_m / sy))
+
+  defp invert(value) when value > 0, do: 1 / value
+  defp invert(_value), do: :infinity
+
+  defp yield_fos(state, sy) do
+    if state.vm_max > 0, do: sy / state.vm_max, else: :infinity
+  end
+
+  @doc """
+  Smallest diameter at a station meeting the target FOS for both fatigue and
+  first-cycle (Langer) yield. Kf/Kfs are held fixed; the size factor kb is
+  re-evaluated at every trial diameter, so this is solved by bisection.
+  """
+  def required_diameter(m, t, n, _kf, _kfs, _sim_case, _marin, _target, _criterion)
+      when m == 0 and t == 0 and n == 0,
+      do: 0.0
+
+  def required_diameter(m, t, n, kf, kfs, sim_case, marin, target, criterion) do
+    fraction = sim_case.fatigue.torque_alternating_fraction
+    sut = sim_case.ultimate_strength
+    sy = sim_case.yield_strength
+
+    passes = fn d ->
+      state = stress_state(d, m, t, n, kf, kfs, fraction)
+      n_f = fos(criterion, state.vm_a, state.vm_m, endurance_limit(d, marin), sut, sy)
+      min(n_f, yield_fos(state, sy)) >= target
+    end
+
+    high = grow_bracket(1.0e-3, passes, 40)
+
+    Enum.reduce(1..60, {1.0e-6, high}, fn _, {low, high} ->
+      middle = 0.5 * (low + high)
+      if passes.(middle), do: {low, middle}, else: {middle, high}
+    end)
+    |> elem(1)
+  end
+
+  # Grow the bracket until the station passes.
+  defp grow_bracket(high, _passes, 0), do: high
+
+  defp grow_bracket(high, passes, remaining) do
+    if passes.(high), do: high, else: grow_bracket(high * 2, passes, remaining - 1)
+  end
+
+  @doc """
+  Fatigue and Langer-yield factors of safety along the shaft. Every criterion
+  is evaluated; the case's selected criterion drives fos_fatigue, the critical
+  section and d_required.
+  """
+  def compute(xs, results, geometry, sim_case) do
+    settings = sim_case.fatigue
+    sut = sim_case.ultimate_strength
+    sy = sim_case.yield_strength
+    target = sim_case.target_factor_of_safety
+    raisers = stress_raisers(geometry, sut)
+    marin = marin_constants(sut, settings)
+    by_position = Map.new(raisers, &{&1.position, &1})
+
+    for raiser <- raisers, raiser.position not in xs do
+      raise ArgumentError,
+            "Station list is missing the stress raiser at x=#{raiser.position}; build stations with build_stations/3"
+    end
+
+    stations =
+      [xs, results.m_y, results.m_z, results.t, results.n]
+      |> Enum.zip()
+      |> Enum.map(fn {x, m_y, m_z, t, n} ->
+        d = Solver.section_at(x, geometry).diameter
+        raiser = by_position[x]
+        kf = if raiser, do: raiser.kf, else: 1.0
+        kfs = if raiser, do: raiser.kfs, else: 1.0
+        m = Numeric.hypot(m_y, m_z)
+        state = stress_state(d, m, t, n, kf, kfs, settings.torque_alternating_fraction)
+        se = endurance_limit(d, marin)
+
+        fos_all =
+          Map.new(@criteria, fn {criterion, _} ->
+            {criterion, fos(criterion, state.vm_a, state.vm_m, se, sut, sy)}
+          end)
+
+        Map.merge(state, %{
+          d: d, m: m, t: t, n: n, kf: kf, kfs: kfs, kb: size_factor(d), se: se,
+          fos_all: fos_all,
+          fos_yield: yield_fos(state, sy),
+          is_raiser: raiser != nil
+        })
+      end)
+
+    column = fn key -> Enum.map(stations, &Map.fetch!(&1, key)) end
+
+    fos_by_criterion =
+      Map.new(@criteria, fn {criterion, _} ->
+        {criterion, Enum.map(stations, & &1.fos_all[criterion])}
+      end)
+
+    d_required_by_criterion =
+      @criteria
+      |> Task.async_stream(fn {criterion, _} ->
+        {criterion,
+         Enum.map(stations, fn s ->
+           required_diameter(s.m, s.t, s.n, s.kf, s.kfs, sim_case, marin, target, criterion)
+         end)}
+      end, timeout: :infinity)
+      |> Map.new(fn {:ok, entry} -> entry end)
+
+    fos_fatigue = fos_by_criterion[settings.criterion]
+    fos_yield = column.(:fos_yield)
+
+    raiser_idx =
+      stations
+      |> Enum.with_index()
+      |> Enum.filter(fn {s, _} -> s.is_raiser end)
+      |> Enum.map(&elem(&1, 1))
+
+    %{
+      sigma_a: column.(:sigma_a),
+      sigma_m: column.(:sigma_m),
+      tau_a: column.(:tau_a),
+      tau_m: column.(:tau_m),
+      vm_a: column.(:vm_a),
+      vm_m: column.(:vm_m),
+      vm_max: column.(:vm_max),
+      kb: column.(:kb),
+      se: column.(:se),
+      marin: marin,
+      kf: column.(:kf),
+      kfs: column.(:kfs),
+      diameter: column.(:d),
+      m: column.(:m),
+      t: column.(:t),
+      n: column.(:n),
+      fos_fatigue: fos_fatigue,
+      fos_yield: fos_yield,
+      fos_by_criterion: fos_by_criterion,
+      d_required_by_criterion: d_required_by_criterion,
+      critical_idx: Numeric.argmin(fos_fatigue),
+      yield_critical_idx: Numeric.argmin(fos_yield),
+      raisers: raisers,
+      raiser_idx: raiser_idx,
+      d_required: d_required_by_criterion[settings.criterion]
+    }
+  end
+
+  @doc "Alternating strength on the failure line at mean stress sm (nil past its end)."
+  def envelope("goodman", sm, se, sut, _sy), do: se * (1 - sm / sut)
+  def envelope("gerber", sm, se, sut, _sy), do: se * (1 - (sm / sut) ** 2)
+  def envelope("soderberg", sm, se, _sut, sy), do: se * (1 - sm / sy)
+
+  def envelope("asme-elliptic", sm, se, _sut, sy) do
+    if sm <= sy, do: se * :math.sqrt(1 - (sm / sy) ** 2)
+  end
+end
+```
+
+## Running a case
+
+`Beam.Sim.run/1` solves in SI and returns every result the report and plots need.
+
+```elixir
+defmodule Beam.Sim do
+  alias Beam.Numeric
+  alias Beam.Solver
+
+  def run(sim_case) do
+    geometry = sim_case.geometry
+    xs = Solver.build_stations(sim_case.length, sim_case.simulated_points, geometry)
+    {applied, reactions} = Solver.build_loads(sim_case.loads, sim_case.supports)
+    all_loads = applied ++ reactions
+    Solver.validate_equilibrium(all_loads)
+
+    loads = Solver.internal_loads(xs, all_loads)
+    deflection = Solver.deflection(xs, loads, geometry, sim_case.material_properties, sim_case.supports)
+    results = Map.merge(loads, deflection)
+    stresses = Solver.stresses(xs, results, geometry)
+    sy = sim_case.yield_strength
+
+    fos =
+      Enum.zip_with(stresses.sigma, stresses.tau, fn sigma, tau ->
+        tau_msst = Numeric.hypot(sigma / 2, tau)
+        if tau_msst > 0, do: sy / (2 * tau_msst), else: :infinity
+      end)
+
+    critical_idx = Numeric.argmin(fos)
+    critical_x = Enum.at(xs, critical_idx)
+
+    fatigue =
+      if sim_case.fatigue != nil do
+        Beam.Fatigue.compute(xs, results, geometry, sim_case)
+      end
+
+    %{
+      xs: xs,
+      applied: applied,
+      reactions: reactions,
+      all_loads: all_loads,
+      results: results,
+      stresses: stresses,
+      fos: fos,
+      critical_idx: critical_idx,
+      critical_x: critical_x,
+      section: Solver.section_grid(critical_x, critical_idx, results, geometry),
+      fatigue: fatigue
+    }
+  end
+end
+```
+
+## Report
+
+The report is built as a list of blocks, then rendered either as Markdown tables or as the same plain text the Python version prints.
+
+```elixir
+defmodule Beam.Report do
+  alias Beam.Fatigue
+  alias Beam.Format
+  alias Beam.Numeric
+  alias Beam.Solver
+  alias Beam.Units
+
+  @headers ["Quantity", "Value", "Unit"]
+
+  def build(sim_case, sol) do
+    units = Units.report(sim_case.unit_system)
+    row = &Units.row(units, &1, &2, &3)
+    geometry = sim_case.geometry
+    %{results: results, stresses: stresses, fos: fos, xs: xs} = sol
+    idx = sol.critical_idx
+    critical_x = sol.critical_x
+    target = sim_case.target_factor_of_safety
+    bending = Enum.zip_with(results.m_y, results.m_z, &Numeric.hypot/2)
+    at = fn values -> Enum.at(values, idx) end
+    rule = String.duplicate("=", 78)
+
+    principal = Solver.principal_stresses(at.(stresses.sigma), at.(stresses.tau))
+    tau_torsion_max = sol.section |> Enum.map(&abs(&1.tau)) |> Enum.max()
+    tau_msst_max = sol.section |> Enum.map(&Numeric.hypot(&1.sigma / 2, &1.tau)) |> Enum.max()
+    section_fos = if tau_msst_max > 0, do: sim_case.yield_strength / (2 * tau_msst_max), else: :infinity
+
+    d_required =
+      Enum.zip_with(bending, results.t, &Solver.required_diameter_msst(&1, &2, sim_case.yield_strength, target))
+
+    required_idx = Numeric.argmax(d_required)
+    required_x = Enum.at(xs, required_idx)
+    gears = Enum.filter(sol.applied, &(&1.type == "driving gear"))
+
+    [
+      {:text, "\n" <> rule <> "\nBEAM STRESS ANALYSIS\n" <> rule, nil},
+      {:text, "  Case   : #{sim_case.case_path}", "**Case:** `#{Path.basename(sim_case.case_path)}`"},
+      {:text, "  Units  : #{sim_case.unit_system} (terminal report)", "**Units:** #{sim_case.unit_system}"},
+      {:text, "  Plots  : #{sim_case.unit_system}, as labeled", nil},
+      {:text, "  Status : Global equilibrium verified", "**Status:** Global equilibrium verified"},
+      table("CASE SUMMARY", @headers, [
+        row.("Beam length", sim_case.length, :length),
+        row.("Mesh spacing setting", sim_case.mesh_density_factor, :length),
+        ["Mesh points", Format.commas(length(xs)), "-"],
+        row.("Young's modulus", sim_case.material_properties.young_modulus, :stress),
+        row.("Yield strength", sim_case.yield_strength, :stress),
+        row.("Target factor of safety", target, :ratio)
+      ]),
+      gears != [] &&
+        table(
+          "DRIVING GEARS",
+          ["x [#{units.labels.length}]", "Power [#{units.labels.power}]", "Speed [RPM]"],
+          Enum.map(gears, fn g ->
+            [Units.number(units, g.position, :length), Units.number(units, g.power, :power), Format.number(g.speed)]
+          end),
+          []
+        ),
+      load_table("APPLIED LOADS", sol.applied, units),
+      load_table("SUPPORT REACTIONS", combine_reactions(sol.reactions), units),
+      table(
+        "PEAK INTERNAL MOMENTS (signed values at maximum magnitude)",
+        @headers ++ ["x [#{units.labels.length}]"],
+        for {name, values} <- [
+              {"Bending M_y", results.m_y},
+              {"Bending M_z", results.m_z},
+              {"Resultant bending", bending},
+              {"Torque T", results.t}
+            ] do
+          peak = values |> Enum.map(&abs/1) |> Numeric.argmax()
+          row.(name, Enum.at(values, peak), :moment) ++ [Units.number(units, Enum.at(xs, peak), :length)]
+        end
+      ),
+      table("CRITICAL SECTION (minimum MSST/Tresca factor of safety)", @headers, [
+        row.("Position x", critical_x, :length),
+        row.("Current diameter", Solver.section_at(critical_x, geometry).diameter, :diameter),
+        row.("Von Mises stress", at.(stresses.von_mises), :stress),
+        row.("Normal stress sigma_x", at.(stresses.sigma), :stress),
+        row.("Torsional shear tau_xy", at.(stresses.tau), :stress),
+        row.("Factor of safety", at.(fos), :ratio),
+        row.("Bending M_y", at.(results.m_y), :moment),
+        row.("Bending M_z", at.(results.m_z), :moment),
+        row.("Resultant bending", at.(bending), :moment),
+        row.("Torque T", at.(results.t), :moment),
+        row.("Deflection y", at.(results.delta_y), :deflection),
+        row.("Deflection z", at.(results.delta_z), :deflection),
+        row.("Slope about y", at.(results.theta_y), :slope),
+        row.("Slope about z", at.(results.theta_z), :slope)
+      ]),
+      table("PRINCIPAL STRESSES (critical section, plane stress)", @headers, [
+        row.("Mohr circle center", principal.center, :stress),
+        row.("Mohr circle radius / max shear", principal.radius, :stress),
+        row.("Principal stress sigma_1", principal.sigma_1, :stress),
+        row.("Principal stress sigma_2", principal.sigma_2, :stress),
+        row.("Principal angle (2D)", principal.theta_p, :angle)
+      ]),
+      table("CROSS-SECTION GRID CHECK (critical section)", @headers, [
+        row.("Maximum torsional shear", tau_torsion_max, :stress),
+        row.("Maximum MSST/Tresca shear", tau_msst_max, :stress),
+        row.("Estimated factor of safety", section_fos, :ratio)
+      ]),
+      table("DIAMETER SIZING (MSST/Tresca)", @headers, [
+        row.("Target factor of safety", target, :ratio),
+        row.("Governing position x", required_x, :length),
+        row.("Required diameter", Enum.at(d_required, required_idx), :diameter),
+        row.("Current diameter", Solver.section_at(required_x, geometry).diameter, :diameter),
+        row.("Current factor of safety", Enum.at(fos, required_idx), :ratio),
+        row.("Torque at sizing section", Enum.at(results.t, required_idx), :moment)
+      ]),
+      recommendations(
+        "DIAMETER RECOMMENDATIONS (sampled ranges below target FOS)",
+        xs, geometry, fos, d_required, target, units
+      ),
+      sol.fatigue && fatigue_blocks(sim_case, xs, sol.fatigue, units),
+      {:text, rule <> "\n", nil}
+    ]
+    |> List.flatten()
+    |> Enum.filter(& &1)
+  end
+
+  defp table(title, headers, rows, left_columns \\ [0]) do
+    {:table, title, headers, rows, left_columns}
+  end
+
+  defp load_table(title, loads, units) do
+    headers =
+      ["Type", "x [#{units.labels.length}]"] ++
+        Enum.map(~w(Fx Fy Fz), &"#{&1} [#{units.labels.force}]") ++
+        Enum.map(~w(Mx My Mz), &"#{&1} [#{units.labels.moment}]")
+
+    rows =
+      Enum.map(loads, fn load ->
+        [load.type, Units.number(units, load.position, :length)] ++
+          Enum.map(load.force, &Units.number(units, &1, :force)) ++
+          Enum.map(load.moment, &Units.number(units, &1, :moment))
+      end)
+
+    table(title, headers, rows)
+  end
+
+  # Reactions are stored by degree of freedom; combine into one row per support.
+  defp combine_reactions(reactions) do
+    reactions
+    |> Enum.chunk_by(& &1.position)
+    |> Enum.map(fn group ->
+      total = fn key -> group |> Enum.map(&Map.fetch!(&1, key)) |> Enum.zip_with(&Enum.sum/1) end
+      %{type: "reaction", position: hd(group).position, force: total.(:force), moment: total.(:moment)}
+    end)
+  end
+
+  defp recommendations(title, xs, geometry, fos, d_required, target, units) do
+    sections = Enum.map(xs, &Solver.section_index(&1, geometry))
+    stations = Enum.zip([xs, sections, fos, d_required])
+
+    rows =
+      geometry
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {segment, index} ->
+        below = Enum.filter(stations, fn {_x, section, n, _d} -> section == index and n < target end)
+
+        if below == [] do
+          []
+        else
+          {worst_x, _, worst_fos, _} = Enum.min_by(below, &elem(&1, 2))
+          recommended = below |> Enum.map(&elem(&1, 3)) |> Enum.max()
+
+          [
+            [
+              Units.number(units, elem(hd(below), 0), :length),
+              Units.number(units, elem(List.last(below), 0), :length),
+              Units.number(units, segment.diameter, :diameter),
+              Units.number(units, recommended, :diameter),
+              Units.number(units, recommended - segment.diameter, :diameter),
+              Format.number(worst_fos),
+              Units.number(units, worst_x, :length)
+            ]
+          ]
+        end
+      end)
+
+    if rows == [] do
+      message = "  All sections meet the target factor of safety (#{Format.number(target)})."
+      {:text, "\n" <> message, String.trim(message)}
+    else
+      length_unit = units.labels.length
+      diameter_unit = units.labels.diameter
+
+      table(
+        title,
+        [
+          "From [#{length_unit}]",
+          "To [#{length_unit}]",
+          "Current [#{diameter_unit}]",
+          "Required [#{diameter_unit}]",
+          "Change [#{diameter_unit}]",
+          "Min FOS",
+          "At x [#{length_unit}]"
+        ],
+        rows,
+        []
+      )
+    end
+  end
+
+  defp fatigue_blocks(sim_case, xs, fatigue, units) do
+    settings = sim_case.fatigue
+    row = &Units.row(units, &1, &2, &3)
+    target = sim_case.target_factor_of_safety
+    idx = fatigue.critical_idx
+    y_idx = fatigue.yield_critical_idx
+    marin = fatigue.marin
+    at = fn values -> Enum.at(values, idx) end
+    temperature_unit = if sim_case.unit_system == "Imperial", do: "F", else: "C"
+    rule = String.duplicate("-", 78)
+    fraction = settings.torque_alternating_fraction
+    title = "FATIGUE ANALYSIS - #{Fatigue.criterion_name(settings.criterion)}, infinite life, rotating shaft"
+
+    steady =
+      "  Bending is fully reversed; torque and axial load are steady" <>
+        if(fraction != 0, do: " (alternating torque = #{Format.number(fraction)} x steady).", else: ".")
+
+    length_unit = units.labels.length
+    diameter_unit = units.labels.diameter
+
+    comparison =
+      for {criterion, name} <- Fatigue.criteria() do
+        fos = fatigue.fos_by_criterion[criterion]
+        d_req = fatigue.d_required_by_criterion[criterion]
+        worst = Numeric.argmin(fos)
+        sizing = Numeric.argmax(d_req)
+
+        [
+          name <> if(criterion == settings.criterion, do: " (selected)", else: ""),
+          Format.number(Enum.at(fos, idx)),
+          Format.number(Enum.at(fos, worst)),
+          Units.number(units, Enum.at(xs, worst), :length),
+          Units.number(units, Enum.at(d_req, sizing), :diameter),
+          Units.number(units, Enum.at(xs, sizing), :length)
+        ]
+      end
+
+    governing = Enum.zip_with(fatigue.fos_fatigue, fatigue.fos_yield, &min/2)
+    d_required = fatigue.d_required
+    required_idx = Numeric.argmax(d_required)
+
+    [
+      {:text, "\n" <> rule <> "\n" <> title <> "\n" <> steady <> "\n" <> rule,
+       "### " <> title <> "\n\n" <> String.trim(steady)},
+      table("ENDURANCE LIMIT (at fatigue critical section)", @headers, [
+        row.("Ultimate strength Sut", sim_case.ultimate_strength, :stress),
+        row.("Unmodified endurance limit Se'", marin.se_prime, :stress),
+        ["Surface factor ka (#{settings.surface_finish})", Format.number(marin.ka), "-"],
+        row.("Size factor kb", at.(fatigue.kb), :ratio),
+        row.("Load factor kc", marin.kc, :ratio),
+        [
+          "Temperature factor kd",
+          Format.number(marin.kd),
+          if(settings.temperature == nil,
+            do: "-",
+            else: "- (at #{Format.number(settings.temperature)} #{temperature_unit})"
+          )
+        ],
+        ["Reliability factor ke (#{Format.number(settings.reliability)})", Format.number(marin.ke), "-"],
+        row.("Endurance limit Se", at.(fatigue.se), :stress)
+      ]),
+      raiser_blocks(fatigue.raisers, units),
+      table("FATIGUE CRITICAL SECTION (minimum fatigue factor of safety)", @headers, [
+        row.("Fatigue position x", Enum.at(xs, idx), :length),
+        row.("Fatigue section diameter", at.(fatigue.diameter), :diameter),
+        row.("Fatigue Kf (bending)", at.(fatigue.kf), :ratio),
+        row.("Fatigue Kfs (torsion)", at.(fatigue.kfs), :ratio),
+        row.("Alternating bending sigma_a", at.(fatigue.sigma_a), :stress),
+        row.("Mean axial sigma_m", at.(fatigue.sigma_m), :stress),
+        row.("Alternating torsion tau_a", at.(fatigue.tau_a), :stress),
+        row.("Mean torsion tau_m", at.(fatigue.tau_m), :stress),
+        row.("Von Mises alternating sigma_a'", at.(fatigue.vm_a), :stress),
+        row.("Von Mises mean sigma_m'", at.(fatigue.vm_m), :stress),
+        row.("Fatigue factor of safety", at.(fatigue.fos_fatigue), :ratio),
+        row.("Langer yield FOS at this section", at.(fatigue.fos_yield), :ratio),
+        row.("Minimum Langer yield FOS", Enum.at(fatigue.fos_yield, y_idx), :ratio),
+        row.("Minimum Langer yield FOS at x", Enum.at(xs, y_idx), :length)
+      ]),
+      table(
+        "FATIGUE CRITERIA COMPARISON (Langer yield included in required diameter)",
+        [
+          "Criterion",
+          "FOS at critical x",
+          "Min FOS",
+          "Min at x [#{length_unit}]",
+          "Required d [#{diameter_unit}]",
+          "Governing x [#{length_unit}]"
+        ],
+        comparison
+      ),
+      {:text,
+       "  Gerber and ASME-elliptic fit test data closely; Goodman is linear and conservative;\n" <>
+         "  Soderberg (yield-based) is the most conservative.",
+       "Gerber and ASME-elliptic fit test data closely; Goodman is linear and conservative; Soderberg (yield-based) is the most conservative."},
+      table("FATIGUE DIAMETER SIZING (fatigue and Langer yield, Kf held fixed)", @headers, [
+        row.("Fatigue target factor of safety", target, :ratio),
+        row.("Fatigue governing position x", Enum.at(xs, required_idx), :length),
+        row.("Fatigue required diameter", Enum.at(d_required, required_idx), :diameter),
+        row.("Fatigue current diameter", Enum.at(fatigue.diameter, required_idx), :diameter)
+      ]),
+      recommendations(
+        "FATIGUE DIAMETER RECOMMENDATIONS (sampled ranges below target FOS)",
+        xs, sim_case.geometry, governing, d_required, target, units
+      )
+    ]
+  end
+
+  defp raiser_blocks([], _units), do: []
+
+  defp raiser_blocks(raisers, units) do
+    diameter_unit = units.labels.diameter
+    number = &Units.number(units, &1, &2)
+
+    rows =
+      Enum.map(raisers, fn r ->
+        note =
+          cond do
+            r.override -> "kf/kfs override"
+            r.r_assumed -> "assumed sharp, r = #{Fatigue.default_fillet_ratio()} d"
+            r.warnings != [] -> "WARNING: r/d out of range"
+            true -> ""
+          end
+
+        [number.(r.position, :length), number.(r.d, :diameter), number.(r.big_d, :diameter), number.(r.r, :diameter)] ++
+          Enum.map([r.kt, r.kts, r.q, r.qs, r.kf, r.kfs], &Format.number/1) ++ [note]
+      end)
+
+    assumed =
+      if Enum.any?(raisers, &(&1.r_assumed and not &1.override)) do
+        message = "  Note: set fillet_radius (or kf/kfs) on [[geometry]] segments to replace assumed sharp fillets."
+        [{:text, message, String.trim(message)}]
+      else
+        []
+      end
+
+    warnings =
+      for raiser <- raisers, warning <- raiser.warnings do
+        message = "  WARNING at x = #{number.(raiser.position, :length)} #{units.labels.length}: #{warning}"
+        {:text, message, "**#{String.trim(message)}**"}
+      end
+
+    [
+      table(
+        "STRESS RAISERS (Kf, Kfs applied at these stations)",
+        ["x [#{units.labels.length}]", "d [#{diameter_unit}]", "D [#{diameter_unit}]", "r [#{diameter_unit}]"] ++
+          ~w(Kt Kts q qs Kf Kfs Note),
+        rows,
+        [10]
+      )
+    ] ++ assumed ++ warnings
+  end
+
+  @doc "The report as plain text, aligned like the Python version's terminal output."
+  def to_text(blocks) do
+    blocks
+    |> Enum.map(fn
+      {:text, text, _markdown} -> text <> "\n"
+      {:table, title, headers, rows, left} -> text_table(title, headers, rows, left)
+    end)
+    |> Enum.join()
+  end
+
+  defp text_table(title, headers, rows, left) do
+    widths =
+      [headers | rows]
+      |> Enum.zip()
+      |> Enum.map(fn cells -> cells |> Tuple.to_list() |> Enum.map(&String.length/1) |> Enum.max() end)
+
+    line = fn cells ->
+      aligned =
+        [cells, widths, 0..(length(widths) - 1)]
+        |> Enum.zip()
+        |> Enum.map(fn {cell, width, index} ->
+          if index in left, do: String.pad_trailing(cell, width), else: String.pad_leading(cell, width)
+        end)
+
+      "  " <> Enum.join(aligned, "  ") <> "\n"
+    end
+
+    "\n#{title}\n" <>
+      line.(headers) <>
+      line.(Enum.map(widths, &String.duplicate("-", &1))) <>
+      Enum.map_join(rows, line)
+  end
+
+  def to_markdown(blocks) do
+    blocks
+    |> Enum.map(fn
+      {:text, _text, nil} -> nil
+      {:text, _text, markdown} -> markdown
+      {:table, title, headers, rows, left} -> markdown_table(title, headers, rows, left)
+    end)
+    |> Enum.filter(& &1)
+    |> Enum.join("\n\n")
+  end
+
+  defp markdown_table(title, headers, rows, left) do
+    cells = fn row -> "| " <> Enum.join(row, " | ") <> " |" end
+
+    rule =
+      headers
+      |> Enum.with_index()
+      |> Enum.map(fn {_, index} -> if index in left, do: "---", else: "---:" end)
+
+    Enum.join(["#### " <> title, "", cells.(headers), cells.(rule) | Enum.map(rows, cells)], "\n")
+  end
+end
+```
+
+## Beam preview and plots
+
+The preview is drawn as SVG: x is to scale, gears are schematic symbols. The other plots are Vega-Lite charts. Stations are thinned for the browser, keeping the stress raisers (fatigue factor of safety dips only at those exact stations) and the critical section.
+
+```elixir
+defmodule Beam.Preview do
+  @moduledoc """
+  Side view of the beam: shaft segments, supports and loads. The y layout is
+  built from the largest shaft radius h, so the shaft stays readable; gears are
+  sized relative to each other, with the mesh side marked.
+  """
+  alias Beam.Format
+  alias Beam.Solver
+  alias Beam.Units
+
+  @plot_width 780.0
+  @slender_height 420.0
+
+  def svg(sim_case, applied) do
+    units = Units.report(sim_case.unit_system)
+    scale = units.scales.length
+    length = sim_case.length / scale
+    h = (sim_case.geometry |> Enum.map(& &1.diameter) |> Enum.max()) / scale / 2
+    gears = Enum.filter(applied, &(&1.type in ["driving gear", "driven gear"]))
+    gear_max = gears |> Enum.map(& &1.diameter) |> Enum.max(fn -> 0.0 end)
+
+    # Slender beams are unreadable at true aspect, so exaggerate y for those.
+    true_aspect = length / (2 * h) <= 6
+    x_span = 1.13 * length
+    y_span = 13.4 * h
+    plot_height = if true_aspect, do: @plot_width * y_span / x_span, else: @slender_height
+
+    scales = %{
+      px: fn x -> 70 + (x + 0.08 * length) / x_span * @plot_width end,
+      py: fn y -> 50 + (7.0 * h - y) / y_span * plot_height end,
+      sx: @plot_width / x_span,
+      sy: plot_height / y_span,
+      h: h,
+      length: length,
+      scale: scale,
+      units: units,
+      geometry: sim_case.geometry,
+      gear_max: gear_max / scale
+    }
+
+    note = if true_aspect, do: "shaft to scale", else: "x to scale, y exaggerated"
+    note = if gears != [], do: note <> "; gears schematic, not to scale", else: note
+
+    title =
+      "Beam preview - #{Path.basename(sim_case.case_path)}  " <>
+        "(L = #{Format.number(length)} #{units.labels.length}, #{note})"
+
+    width = @plot_width + 100
+    height = plot_height + 120
+
+    body =
+      [
+        rect(0, 0, width, height, fill: "white"),
+        text(width / 2, 26, title, size: 15, anchor: "middle"),
+        Enum.map(gears, &gear(&1, scales)),
+        shaft(sim_case.geometry, scales),
+        Enum.map(sim_case.supports, &support(&1, scales)),
+        Enum.map(applied, &point_load(&1, scales)),
+        axis(sim_case.supports ++ applied, plot_height, scales)
+      ]
+
+    ~s(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 #{f(width)} #{f(height)}" ) <>
+      ~s(font-family="sans-serif">#{IO.iodata_to_binary(body)}</svg>)
+  end
+
+  defp shaft(geometry, s) do
+    labels = [-4.6 * s.h, -5.4 * s.h]
+    crowded = Enum.any?(geometry, &((&1.stop - &1.start) / s.scale < 0.08 * s.length))
+    centerline = line(s.px.(-0.04 * s.length), s.py.(0), s.px.(1.02 * s.length), s.py.(0), "black", 0.8, "10 3 2 3")
+
+    segments =
+      geometry
+      |> Enum.with_index()
+      |> Enum.map(fn {segment, index} ->
+        start = segment.start / s.scale
+        stop = segment.stop / s.scale
+        d = segment.diameter / s.scale
+        middle = (start + stop) / 2
+        label_y = if crowded, do: Enum.at(labels, rem(index, 2)), else: hd(labels)
+
+        [
+          line(s.px.(middle), s.py.(-d / 2), s.px.(middle), s.py.(label_y), "gray", 0.6),
+          text(s.px.(middle), s.py.(label_y) + 12, "Ø#{Units.number(s.units, segment.diameter, :diameter)}", size: 10, anchor: "middle"),
+          rect(s.px.(start), s.py.(d / 2), (stop - start) * s.sx, d * s.sy, fill: "lightgray", stroke: "black", stroke_width: 1.2)
+        ]
+      end)
+
+    unit_label = text(s.px.(-0.075 * s.length), s.py.(-6.2 * s.h), "shaft Ø [#{s.units.labels.diameter}]", size: 10, fill: "dimgray")
+    [segments, centerline, unit_label]
+  end
+
+  defp support(support, s) do
+    x = support.position / s.scale
+    y0 = -Solver.section_at(support.position, s.geometry).diameter / s.scale / 2
+    label = [support.type, "x = #{Format.number(x)} #{s.units.labels.length}"]
+    tri_h = 0.8 * s.h
+    tri_w = 0.012 * s.length
+
+    if support.type == "bearing" do
+      points = [{x, y0}, {x - tri_w, y0 - tri_h}, {x + tri_w, y0 - tri_h}]
+
+      [
+        polygon(Enum.map(points, fn {a, b} -> {s.px.(a), s.py.(b)} end), "white", "black"),
+        label_block(s.px.(x), s.py.(y0 - tri_h) + 14, label, anchor(x, s.length), :down, "black")
+      ]
+    else
+      wall = 0.02 * s.length
+
+      [
+        rect(s.px.(x - wall / 2), s.py.(2.2 * s.h), wall * s.sx, 4.4 * s.h * s.sy, fill: "#88888855", stroke: "black", stroke_width: 1.2),
+        label_block(s.px.(x), s.py.(-2.3 * s.h) + 14, label, anchor(x, s.length), :down, "black")
+      ]
+    end
+  end
+
+  defp point_load(%{type: "point load"} = load, s) do
+    x = load.position / s.scale
+    [fx, fy, fz] = Enum.map(load.force, &(&1 / s.units.scales.force))
+    r_shaft = Solver.section_at(load.position, s.geometry).diameter / s.scale / 2
+    arrow_length = 1.5 * s.h
+    # Arrow points in the direction of Fy (down if Fy < 0), tail away from the shaft.
+    tail = if fy < 0, do: 1, else: -1
+    label = ["point load", "F = (#{Format.number(fx)}, #{Format.number(fy)}, #{Format.number(fz)}) #{s.units.labels.force}"]
+    tail_y = tail * (r_shaft + arrow_length)
+
+    [
+      if(Beam.Numeric.hypot(fy, fz) > 0,
+        do: arrow(s.px.(x), s.py.(tail_y), s.px.(x), s.py.(tail * r_shaft), "red"),
+        else: []
+      ),
+      label_block(s.px.(x), s.py.(tail * (r_shaft + arrow_length * 1.1)), label, anchor(x, s.length), if(tail > 0, do: :up, else: :down), "red")
+    ]
+  end
+
+  defp point_load(%{type: "point moment"} = load, s) do
+    x = load.position / s.scale
+    [mx, my, mz] = Enum.map(load.moment, &(&1 / s.units.scales.moment))
+    r_shaft = Solver.section_at(load.position, s.geometry).diameter / s.scale / 2
+    label = ["point moment", "M = (#{Format.number(mx)}, #{Format.number(my)}, #{Format.number(mz)}) #{s.units.labels.moment}"]
+
+    [
+      ~s(<circle cx="#{f(s.px.(x))}" cy="#{f(s.py.(r_shaft))}" r="6" fill="none" stroke="purple" stroke-width="1.8"/>),
+      label_block(s.px.(x), s.py.(r_shaft + 0.6 * s.h), label, anchor(x, s.length), :up, "purple")
+    ]
+  end
+
+  defp point_load(_load, _s), do: []
+
+  # Schematic side view of a spur gear: a blank with tooth bands top and bottom.
+  # Height grows with pitch diameter (relative to the largest gear) but stays
+  # within a few shaft radii, so it never dwarfs the shaft.
+  defp gear(gear, s) do
+    x = gear.position / s.scale
+    h = s.h
+    half = h * (1.8 + 1.4 * (gear.diameter / s.scale) / s.gear_max)
+    width = 0.022 * s.length
+    tooth = 0.22 * half
+    color = if gear.type == "driving gear", do: "steelblue", else: "darkorange"
+    left = s.px.(x - width / 2)
+    pixel_width = width * s.sx
+    {mesh_note, marker} = mesh_marker(gear.orientation, x, half, width, color, s)
+
+    title =
+      [
+        gear.type,
+        "D = #{Units.number(s.units, gear.diameter, :diameter)} #{s.units.labels.diameter}, #{Format.short(gear.tooth_angle)}°",
+        "mesh: #{gear.orientation} (#{mesh_note})"
+      ] ++
+        if gear.type == "driving gear" do
+          ["#{Units.number(s.units, gear.power, :power)} #{s.units.labels.power} @ #{Format.short(gear.speed)} RPM"]
+        else
+          []
+        end
+
+    top = half + if gear.orientation == "top", do: 1.0 * h, else: 0.15 * h
+
+    [
+      rect(left, s.py.(half), pixel_width, 2 * half * s.sy, fill: color, fill_opacity: 0.25, stroke: color, stroke_width: 1.5),
+      rect(left, s.py.(half), pixel_width, tooth * s.sy, fill: "white", stroke: color),
+      rect(left, s.py.(-half + tooth), pixel_width, tooth * s.sy, fill: "white", stroke: color),
+      marker,
+      label_block(s.px.(x), s.py.(top), title, anchor(x, s.length), :up, color)
+    ]
+  end
+
+  # Mesh side. +x right, +y up, so +z points out of the page: top/bottom (+-y)
+  # get an arrow toward the mate; left (+z) is out of the page (dot), right (-z)
+  # is into the page (cross).
+  defp mesh_marker(orientation, x, half, _width, color, s) when orientation in ["top", "bottom"] do
+    sign = if orientation == "top", do: 1, else: -1
+    note = if orientation == "top", do: "+y", else: "-y"
+    from_y = s.py.(sign * (half + 0.1 * s.h))
+    to_y = s.py.(sign * (half + 0.9 * s.h))
+    {note, arrow(s.px.(x), from_y, s.px.(x), to_y, color)}
+  end
+
+  defp mesh_marker(orientation, x, half, width, color, s) do
+    cx = s.px.(x + width / 2 + 0.012 * s.length)
+    cy = s.py.(0.55 * half)
+    circle = ~s(<circle cx="#{f(cx)}" cy="#{f(cy)}" r="7" fill="white" stroke="#{color}" stroke-width="1.5"/>)
+
+    if orientation == "left" do
+      {"+z, out of page", [circle, ~s(<circle cx="#{f(cx)}" cy="#{f(cy)}" r="2" fill="#{color}"/>)]}
+    else
+      cross = [line(cx - 4, cy - 4, cx + 4, cy + 4, color, 1.5), line(cx - 4, cy + 4, cx + 4, cy - 4, color, 1.5)]
+      {"-z, into page", [circle, cross]}
+    end
+  end
+
+  # Station marks along the x axis for every support and load.
+  defp axis(items, plot_height, s) do
+    y = 50 + plot_height
+    stations = items |> Enum.map(&(&1.position / s.scale)) |> Enum.sort() |> Enum.dedup()
+
+    ticks =
+      Enum.map(stations, fn x ->
+        px = s.px.(x)
+        label = Format.number(x)
+
+        [
+          line(px, y, px, y + 6, "black", 1),
+          line(px, 50, px, y, "#cccccc", 0.6),
+          ~s|<text x="#{f(px)}" y="#{f(y + 18)}" font-size="10" text-anchor="end" transform="rotate(-45 #{f(px)} #{f(y + 18)})">#{escape(label)}</text>|
+        ]
+      end)
+
+    [
+      line(s.px.(-0.08 * s.length), y, s.px.(1.05 * s.length), y, "black", 1),
+      ticks,
+      text(s.px.(0.485 * s.length), y + 52, "x (#{s.units.labels.length})", size: 12, anchor: "middle")
+    ]
+  end
+
+  # Text alignment that keeps a label near either beam end inside the plot.
+  defp anchor(x, length) do
+    cond do
+      x > 0.9 * length -> "end"
+      x < 0.1 * length -> "start"
+      true -> "middle"
+    end
+  end
+
+  defp label_block(x, y, lines, anchor, direction, color) do
+    first = if direction == :up, do: y - (length(lines) - 1) * 13, else: y
+
+    lines
+    |> Enum.with_index()
+    |> Enum.map(fn {content, index} ->
+      text(x, first + index * 13, content, size: 11, anchor: anchor, fill: color, halo: true)
+    end)
+  end
+
+  defp arrow(x1, y1, x2, y2, color) do
+    size = 8.0
+    direction = if y2 > y1, do: -1, else: 1
+    head = [{x2, y2}, {x2 - size / 2, y2 + direction * size}, {x2 + size / 2, y2 + direction * size}]
+    [line(x1, y1, x2, y2 + direction * size, color, 1.8), polygon(head, color, color)]
+  end
+
+  defp line(x1, y1, x2, y2, color, width, dash \\ nil) do
+    dash_attribute = if dash, do: ~s( stroke-dasharray="#{dash}"), else: ""
+
+    ~s(<line x1="#{f(x1)}" y1="#{f(y1)}" x2="#{f(x2)}" y2="#{f(y2)}" stroke="#{color}" stroke-width="#{width}"#{dash_attribute}/>)
+  end
+
+  defp rect(x, y, width, height, options) do
+    fill = Keyword.get(options, :fill, "none")
+    stroke = Keyword.get(options, :stroke, "none")
+    stroke_width = Keyword.get(options, :stroke_width, 1)
+    fill_opacity = Keyword.get(options, :fill_opacity, 1)
+
+    ~s(<rect x="#{f(x)}" y="#{f(y)}" width="#{f(width)}" height="#{f(height)}" fill="#{fill}" fill-opacity="#{fill_opacity}" stroke="#{stroke}" stroke-width="#{stroke_width}"/>)
+  end
+
+  defp polygon(points, fill, stroke) do
+    coordinates = Enum.map_join(points, " ", fn {x, y} -> "#{f(x)},#{f(y)}" end)
+    ~s(<polygon points="#{coordinates}" fill="#{fill}" stroke="#{stroke}" stroke-width="1.2"/>)
+  end
+
+  defp text(x, y, content, options) do
+    size = Keyword.get(options, :size, 11)
+    text_anchor = Keyword.get(options, :anchor, "start")
+    fill = Keyword.get(options, :fill, "black")
+
+    halo =
+      if Keyword.get(options, :halo, false) do
+        ~s( paint-order="stroke" stroke="white" stroke-width="3")
+      else
+        ""
+      end
+
+    ~s(<text x="#{f(x)}" y="#{f(y)}" font-size="#{size}" text-anchor="#{text_anchor}" fill="#{fill}"#{halo}>#{escape(content)}</text>)
+  end
+
+  defp escape(content) do
+    content
+    |> String.replace("&", "&amp;")
+    |> String.replace("<", "&lt;")
+    |> String.replace(">", "&gt;")
+  end
+
+  defp f(value), do: :erlang.float_to_binary(value * 1.0, [{:decimals, 2}])
+end
+
+defmodule Beam.Plots do
+  alias Beam.Fatigue
+  alias Beam.Format
+  alias Beam.Solver
+  alias Beam.Units
+  alias VegaLite, as: Vl
+
+  # Fatigue diagram: an operating point up to this many times beyond the
+  # envelope axes widens the axes; farther out it is drawn as an edge arrow.
+  @off_scale_limit 3.0
+  @max_plot_stations 800
+  @section_cells 61
+  @criterion_colors %{
+    "goodman" => "steelblue",
+    "gerber" => "seagreen",
+    "asme-elliptic" => "mediumvioletred",
+    "soderberg" => "saddlebrown"
+  }
+
+  defp keep_indices(sol) do
+    count = length(sol.xs)
+    step = max(div(count, @max_plot_stations), 1)
+    raisers = if sol.fatigue, do: sol.fatigue.raiser_idx, else: []
+    neighbours = Enum.flat_map(raisers, &[&1 - 1, &1, &1 + 1])
+
+    (Enum.take_every(0..(count - 1), step) ++ neighbours ++ [sol.critical_idx, count - 1])
+    |> Enum.filter(&(&1 >= 0 and &1 < count))
+    |> MapSet.new()
+  end
+
+  defp thin(values, keep) do
+    values
+    |> Enum.with_index()
+    |> Enum.filter(fn {_, index} -> MapSet.member?(keep, index) end)
+    |> Enum.map(&elem(&1, 0))
+  end
+
+  defp quantitative(vl, channel, field, title, options \\ []) do
+    Vl.encode_field(vl, channel, field, [type: :quantitative, title: title] ++ options)
+  end
+
+  def internal_loads(sim_case, sol) do
+    diagrams(sim_case, sol, "steelblue", [
+      {:v_y, "Shear V_y", :force},
+      {:v_z, "Shear V_z", :force},
+      {:m_y, "Bending M_y", :moment},
+      {:m_z, "Bending M_z", :moment},
+      {:t, "Torsion T", :moment},
+      {:n, "Axial N", :force}
+    ])
+  end
+
+  def deflection(sim_case, sol) do
+    diagrams(sim_case, sol, "darkorange", [
+      {:theta_y, "Slope theta_y", :slope},
+      {:theta_z, "Slope theta_z", :slope},
+      {:delta_y, "Deflection delta_y", :deflection},
+      {:delta_z, "Deflection delta_z", :deflection}
+    ])
+  end
+
+  defp diagrams(sim_case, sol, color, entries) do
+    units = Units.report(sim_case.unit_system)
+    keep = keep_indices(sol)
+    xs = sol.xs |> thin(keep) |> Enum.map(&(&1 / units.scales.length))
+    critical = sol.critical_x / units.scales.length
+    x_title = "x (#{units.labels.length})"
+
+    charts =
+      Enum.map(entries, fn {key, title, quantity} ->
+        values = sol.results[key] |> thin(keep) |> Enum.map(&(&1 / units.scales[quantity]))
+        data = Enum.zip_with(xs, values, &%{x: &1, y: &2})
+        label = units.labels[quantity]
+        encode = fn vl -> vl |> quantitative(:x, "x", x_title) |> quantitative(:y, "y", label) end
+
+        Vl.new(width: 330, height: 170, title: "#{title} (#{label})")
+        |> Vl.layers([
+          Vl.new() |> Vl.data_from_values(data) |> Vl.mark(:area, opacity: 0.15, color: color) |> encode.(),
+          Vl.new() |> Vl.data_from_values(data) |> Vl.mark(:line, color: color, stroke_width: 1.5) |> encode.(),
+          Vl.new()
+          |> Vl.data_from_values([%{x: critical}])
+          |> Vl.mark(:rule, color: "red", stroke_dash: [4, 3])
+          |> quantitative(:x, "x", x_title)
+        ])
+      end)
+
+    Vl.new(columns: 2) |> Vl.concat(charts, :wrappable)
+  end
+
+  def mohrs_circle(sim_case, sol) do
+    units = Units.report(sim_case.unit_system)
+    stress_unit = units.labels.stress
+    scale = units.scales.stress
+    sigma_x = Enum.at(sol.stresses.sigma, sol.critical_idx) / scale
+    tau_xy = Enum.at(sol.stresses.tau, sol.critical_idx) / scale
+    principal = Solver.principal_stresses(sigma_x, tau_xy)
+    center = principal.center
+    radius = principal.radius
+    extent = 1.15 * if(radius > 0, do: radius, else: 1.0)
+    number = &Format.number/1
+
+    circle =
+      Enum.map(0..360, fn degrees ->
+        angle = degrees * :math.pi() / 180
+        %{i: degrees, x: center + radius * :math.cos(angle), y: radius * :math.sin(angle)}
+      end)
+
+    points = [
+      {"Point A (sigma=#{number.(sigma_x)}, tau=#{number.(-tau_xy)} #{stress_unit})", sigma_x, -tau_xy, "coral", "circle"},
+      {"Point B (sigma=0, tau=#{number.(tau_xy)} #{stress_unit})", 0.0, tau_xy, "steelblue", "circle"},
+      {"sigma_1 = #{number.(principal.sigma_1)} #{stress_unit}", principal.sigma_1, 0.0, "red", "triangle-up"},
+      {"sigma_2 = #{number.(principal.sigma_2)} #{stress_unit}", principal.sigma_2, 0.0, "green", "triangle-down"},
+      {"tau_max = #{number.(radius)} #{stress_unit}", center, radius, "purple", "square"},
+      {"C = #{number.(center)} #{stress_unit}", center, 0.0, "black", "circle"}
+    ]
+
+    labels = Enum.map(points, &elem(&1, 0))
+    colors = Enum.map(points, &elem(&1, 3))
+    shapes = Enum.map(points, &elem(&1, 4))
+    data = Enum.map(points, fn {label, x, y, _, _} -> %{label: label, x: x, y: y} end)
+    x_title = "Normal stress sigma (#{stress_unit})"
+    y_title = "Shear stress tau (#{stress_unit})"
+    x_scale = [scale: [domain: [center - extent, center + extent], nice: false]]
+    y_scale = [scale: [domain: [-extent, extent], nice: false]]
+
+    encode = fn vl ->
+      vl
+      |> quantitative(:x, "x", x_title, x_scale)
+      |> quantitative(:y, "y", y_title, y_scale)
+    end
+
+    x_c = Units.number(units, sol.critical_x, :length)
+    d = Units.number(units, Solver.section_at(sol.critical_x, sim_case.geometry).diameter, :diameter)
+
+    Vl.new(
+      width: 460,
+      height: 460,
+      title: "Mohr's circle - critical section x = #{x_c} #{units.labels.length}  (d = #{d} #{units.labels.diameter})"
+    )
+    |> Vl.layers([
+      Vl.new()
+      |> Vl.data_from_values(circle)
+      |> Vl.mark(:line, color: "steelblue", stroke_width: 1.5)
+      |> encode.()
+      |> Vl.encode_field(:order, "i", type: :quantitative),
+      Vl.new()
+      |> Vl.data_from_values([%{x: sigma_x, y: -tau_xy, i: 0}, %{x: 0.0, y: tau_xy, i: 1}])
+      |> Vl.mark(:line, color: "gray", stroke_width: 0.8, stroke_dash: [4, 3])
+      |> encode.()
+      |> Vl.encode_field(:order, "i", type: :quantitative),
+      Vl.new()
+      |> Vl.data_from_values(data)
+      |> Vl.mark(:point, filled: true, size: 90, opacity: 1)
+      |> encode.()
+      |> Vl.encode_field(:color, "label",
+        type: :nominal,
+        title: nil,
+        scale: [domain: labels, range: colors],
+        legend: [orient: "bottom", columns: 2, label_limit: 0]
+      )
+      |> Vl.encode_field(:shape, "label", type: :nominal, title: nil, scale: [domain: labels, range: shapes])
+    ])
+  end
+
+  def section_heatmap(sim_case, sol) do
+    units = Units.report(sim_case.unit_system)
+    grid = Solver.section_grid(sol.critical_x, sol.critical_idx, sol.results, sim_case.geometry, @section_cells)
+    stress_scale = units.scales.stress
+    length_scale = units.scales.diameter
+    stress_unit = units.labels.stress
+
+    charts =
+      Enum.map(
+        [{:sigma, "Normal stress sigma"}, {:tau, "Shear stress tau"}, {:von_mises, "Von Mises sigma_vm"}],
+        fn {key, title} ->
+          data =
+            Enum.map(grid, fn cell ->
+              %{y: cell.y / length_scale, z: cell.z / length_scale, value: Map.fetch!(cell, key) / stress_scale}
+            end)
+
+          Vl.new(width: 135, height: 135, title: "#{title} (#{stress_unit})")
+          |> Vl.data_from_values(data)
+          |> Vl.mark(:square, size: 8, opacity: 1)
+          |> quantitative(:x, "y", "y (#{units.labels.diameter})")
+          |> quantitative(:y, "z", "z (#{units.labels.diameter})")
+          |> quantitative(:color, "value", stress_unit, scale: [scheme: "redblue", reverse: true])
+        end
+      )
+
+    x_c = Units.number(units, sol.critical_x, :length)
+
+    Vl.new(title: "Critical section at x = #{x_c} #{units.labels.length}")
+    |> Vl.concat(charts, :horizontal)
+    |> Vl.resolve(:scale, color: :independent)
+  end
+
+  @doc "Factors of safety along the shaft: static MSST, fatigue and Langer yield."
+  def fatigue_fos(sim_case, sol) do
+    fatigue = sol.fatigue
+    settings = sim_case.fatigue
+    units = Units.report(sim_case.unit_system)
+    keep = keep_indices(sol)
+    target = sim_case.target_factor_of_safety
+    xs = sol.xs |> thin(keep) |> Enum.map(&(&1 / units.scales.length))
+
+    # Unloaded stations have infinite FOS; cap the axis so the interesting range shows.
+    finite =
+      (sol.fos ++ fatigue.fos_fatigue ++ fatigue.fos_yield)
+      |> Enum.reject(&(&1 == :infinity))
+
+    cap = if finite == [], do: 4 * target, else: max(4 * target, 1.2 * Enum.min(finite))
+
+    others =
+      for {criterion, name} <- Fatigue.criteria(), criterion != settings.criterion do
+        {"fatigue (#{name})", fatigue.fos_by_criterion[criterion], @criterion_colors[criterion], [4, 3], 0.9}
+      end
+
+    series =
+      [
+        {"static yield (MSST, nominal)", sol.fos, "gray", [1, 0], 1.5},
+        {"first-cycle yield (Langer, with Kf)", fatigue.fos_yield, "darkorange", [1, 0], 1.5},
+        {"fatigue (#{Fatigue.criterion_name(settings.criterion)})", fatigue.fos_fatigue, "steelblue", [1, 0], 1.5}
+      ] ++ others
+
+    labels = Enum.map(series, &elem(&1, 0))
+    colors = Enum.map(series, &elem(&1, 2))
+    x_title = "x (#{units.labels.length})"
+
+    lines =
+      Enum.map(series, fn {label, values, _color, dash, width} ->
+        capped = values |> thin(keep) |> Enum.map(&min(&1, cap))
+
+        Vl.new()
+        |> Vl.data_from_values(Enum.zip_with(xs, capped, &%{x: &1, y: &2, series: label}))
+        |> Vl.mark(:line, stroke_dash: dash, stroke_width: width, clip: true)
+        |> quantitative(:x, "x", x_title)
+        |> quantitative(:y, "y", "factor of safety (capped at #{Format.number(cap)})",
+          scale: [domain: [0, cap], nice: false]
+        )
+        |> Vl.encode_field(:color, "series",
+          type: :nominal,
+          title: nil,
+          scale: [domain: labels, range: colors],
+          legend: [orient: "bottom", columns: 3, label_limit: 0]
+        )
+      end)
+
+    target_rule =
+      Vl.new()
+      |> Vl.data_from_values([%{y: target}])
+      |> Vl.mark(:rule, color: "red", stroke_dash: [4, 3])
+      |> quantitative(:y, "y", nil)
+
+    raisers =
+      Vl.new()
+      |> Vl.data_from_values(Enum.map(fatigue.raisers, &%{x: &1.position / units.scales.length}))
+      |> Vl.mark(:rule, color: "purple", stroke_dash: [1, 2])
+      |> quantitative(:x, "x", nil)
+
+    Vl.new(
+      width: 770,
+      height: 340,
+      title: [
+        text: "Factor of safety along the shaft - #{Path.basename(sim_case.case_path)}",
+        subtitle: "red: target FOS = #{Format.number(target)}, purple: stress raisers"
+      ]
+    )
+    |> Vl.layers(lines ++ [target_rule, raisers])
+  end
+
+  @doc "Mean-alternating (Haigh) diagram at the fatigue critical section, all criteria."
+  def fatigue_diagram(sim_case, sol) do
+    fatigue = sol.fatigue
+    settings = sim_case.fatigue
+    units = Units.report(sim_case.unit_system)
+    scale = units.scales.stress
+    stress_unit = units.labels.stress
+    idx = fatigue.critical_idx
+    at = fn values -> Enum.at(values, idx) end
+    se = at.(fatigue.se)
+    sut = sim_case.ultimate_strength
+    sy = sim_case.yield_strength
+    selected = settings.criterion
+    means = Beam.Numeric.linspace(0.0, sut, 200)
+    number = &Format.number/1
+
+    envelope_points = fn criterion, endurance, shrink ->
+      means
+      |> Enum.map(&{&1, Fatigue.envelope(criterion, &1, endurance, sut, sy)})
+      |> Enum.filter(fn {_, value} -> value != nil and value >= 0 end)
+      |> Enum.map(fn {mean, value} -> {mean / shrink / scale, value / shrink / scale} end)
+    end
+
+    envelopes =
+      for {criterion, name} <- Fatigue.criteria() do
+        n_c = number.(Enum.at(fatigue.fos_by_criterion[criterion], idx))
+        chosen = criterion == selected
+        label = "#{name}#{if chosen, do: " (selected)", else: ""}, n = #{n_c}"
+
+        {label, envelope_points.(criterion, se, 1), @criterion_colors[criterion],
+         if(chosen, do: [1, 0], else: [4, 3]), if(chosen, do: 2.2, else: 1.0)}
+      end
+
+    langer = {"Langer first-cycle yield line", [{0.0, sy / scale}, {sy / scale, 0.0}], "darkorange", [4, 3], 1.2}
+
+    vm_a = at.(fatigue.vm_a)
+    vm_m = at.(fatigue.vm_m)
+    n = at.(fatigue.fos_fatigue)
+    px = vm_m / scale
+    py = vm_a / scale
+    x_max = 1.05 * max(sut, sy) / scale
+    y_max = 1.05 * max(se, sy) / scale
+
+    # A point a little outside the envelopes widens the axes; one far outside
+    # (n well below 1) would shrink the envelopes to nothing, so it is drawn
+    # as an arrow on the plot edge, pointing along the load line instead.
+    overshoot = max(px / x_max, py / y_max)
+
+    {x_max, y_max, overshoot} =
+      if overshoot > 1 and overshoot <= @off_scale_limit do
+        {x_max * overshoot * 1.05, y_max * overshoot * 1.05, 1.0}
+      else
+        {x_max, y_max, overshoot}
+      end
+
+    point_label = "operating point (n = #{number.(n)}): sigma_m' = #{number.(px)}, sigma_a' = #{number.(py)} #{stress_unit}"
+
+    {marker, load_line_end} =
+      cond do
+        overshoot <= 1 and n == :infinity ->
+          {{point_label, px, py, "red", "circle", 0.0, 90}, nil}
+
+        overshoot <= 1 ->
+          {{point_label, px, py, "red", "circle", 0.0, 90}, {n * px, n * py}}
+
+        true ->
+          # Fraction of the way to the point that lands just inside the axes.
+          edge = 0.97 / overshoot
+          angle = :math.atan2(edge * px, edge * py) * 180 / :math.pi()
+          label = "#{point_label} [off scale, #{number.(overshoot)}x beyond axes]"
+          {{label, edge * px, edge * py, "red", "triangle-up", angle, 220}, {edge * px, edge * py}}
+      end
+
+    load_line =
+      if load_line_end do
+        [{"load line", [{0.0, 0.0}, load_line_end], "red", [1, 3], 0.8}]
+      else
+        []
+      end
+
+    # Design point: this section's stresses at the diameter that just meets the
+    # target FOS (selected criterion and Langer yield, Kf held fixed). Se changes
+    # with diameter through kb, so the design line uses Se at that diameter.
+    d_req = at.(fatigue.d_required)
+    target = sim_case.target_factor_of_safety
+
+    {design_line, design_marker} =
+      if d_req > 0 do
+        design =
+          Fatigue.stress_state(
+            d_req, at.(fatigue.m), at.(fatigue.t), at.(fatigue.n),
+            at.(fatigue.kf), at.(fatigue.kfs), settings.torque_alternating_fraction
+          )
+
+        se_req = Fatigue.endurance_limit(d_req, fatigue.marin)
+        name = Fatigue.criterion_name(selected)
+        d_text = "#{Units.number(units, d_req, :diameter)} #{units.labels.diameter}"
+        current = "#{Units.number(units, at.(fatigue.diameter), :diameter)} #{units.labels.diameter}"
+        # A constant-n line is the failure line shrunk toward the origin by 1/n on both axes.
+        {[{"#{name} design line, n = #{number.(target)}", envelope_points.(selected, se_req, target), @criterion_colors[selected], [1, 2], 1.0}],
+         [{"target FOS = #{number.(target)} point: required d = #{d_text} (current #{current})", design.vm_m / scale, design.vm_a / scale, "green", "diamond", 0.0, 160}]}
+      else
+        {[], []}
+      end
+
+    line_series = envelopes ++ [langer] ++ load_line ++ design_line
+    markers = [marker | design_marker]
+    labels = Enum.map(line_series, &elem(&1, 0)) ++ Enum.map(markers, &elem(&1, 0))
+    colors = Enum.map(line_series, &elem(&1, 2)) ++ Enum.map(markers, &elem(&1, 3))
+
+    x_title = "von Mises mean stress sigma_m' (#{stress_unit})"
+    y_title = "von Mises alternating stress sigma_a' (#{stress_unit})"
+    color = [
+      type: :nominal,
+      title: nil,
+      scale: [domain: labels, range: colors],
+      legend: [orient: "bottom", columns: 1, label_limit: 0]
+    ]
+
+    encode = fn vl ->
+      vl
+      |> quantitative(:x, "x", x_title, scale: [domain: [0, x_max], nice: false])
+      |> quantitative(:y, "y", y_title, scale: [domain: [0, y_max], nice: false])
+      |> Vl.encode_field(:color, "series", color)
+    end
+
+    line_layers =
+      Enum.map(line_series, fn {label, points, _color, dash, width} ->
+        data =
+          points
+          |> Enum.with_index()
+          |> Enum.map(fn {{x, y}, i} -> %{x: x, y: y, i: i, series: label} end)
+
+        Vl.new()
+        |> Vl.data_from_values(data)
+        |> Vl.mark(:line, stroke_dash: dash, stroke_width: width, clip: true)
+        |> encode.()
+        |> Vl.encode_field(:order, "i", type: :quantitative)
+      end)
+
+    marker_layers =
+      Enum.map(markers, fn {label, x, y, _color, shape, angle, size} ->
+        Vl.new()
+        |> Vl.data_from_values([%{x: x, y: y, series: label}])
+        |> Vl.mark(:point, filled: true, shape: shape, angle: angle, size: size, opacity: 1)
+        |> encode.()
+      end)
+
+    x_c = Units.number(units, Enum.at(sol.xs, idx), :length)
+
+    Vl.new(
+      width: 640,
+      height: 520,
+      title: "Fatigue diagram - critical section x = #{x_c} #{units.labels.length}  (Se = #{Units.number(units, se, :stress)} #{stress_unit})"
+    )
+    |> Vl.layers(line_layers ++ marker_layers)
+  end
+end
+```
+
+## Results
+
+<!-- livebook:{"reevaluate_automatically":true} -->
+
+```elixir
+sim_case = case_input |> Kino.Input.read() |> Beam.Case.load()
+solution = Beam.Sim.run(sim_case)
+report = Beam.Report.build(sim_case, solution)
+
+Kino.Layout.tabs(
+  Tables: report |> Beam.Report.to_markdown() |> Kino.Markdown.new(),
+  "Plain text": report |> Beam.Report.to_text() |> Kino.Text.new()
+)
+```
+
+### Beam preview
+
+<!-- livebook:{"reevaluate_automatically":true} -->
+
+```elixir
+sim_case |> Beam.Preview.svg(solution.applied) |> Kino.Image.new(:svg)
+```
+
+### Internal loads
+
+<!-- livebook:{"reevaluate_automatically":true} -->
+
+```elixir
+Beam.Plots.internal_loads(sim_case, solution)
+```
+
+### Slope and deflection
+
+<!-- livebook:{"reevaluate_automatically":true} -->
+
+```elixir
+Beam.Plots.deflection(sim_case, solution)
+```
+
+### Mohr's circle
+
+<!-- livebook:{"reevaluate_automatically":true} -->
+
+```elixir
+Beam.Plots.mohrs_circle(sim_case, solution)
+```
+
+### Critical cross section
+
+<!-- livebook:{"reevaluate_automatically":true} -->
+
+```elixir
+Beam.Plots.section_heatmap(sim_case, solution)
+```
+
+### Fatigue
+
+<!-- livebook:{"reevaluate_automatically":true} -->
+
+```elixir
+if solution.fatigue do
+  Kino.Layout.grid([
+    Beam.Plots.fatigue_fos(sim_case, solution),
+    Beam.Plots.fatigue_diagram(sim_case, solution)
+  ])
+else
+  Kino.Markdown.new("This case has no `[fatigue]` section.")
+end
+```

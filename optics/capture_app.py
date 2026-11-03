@@ -6,6 +6,9 @@ centroid and reports flux, FWHM and encircled energy (Spot tab has the radial
 profile). The aperture stays put across captures, so it re-measures every new
 frame -- handy while focusing.
 
+The Stage tab talks to stage_server.py: jog the stage, or run a repeatability
+test (move away, come back, capture, measure FWHM; repeat) and save a report.
+
 Usage:
     python capture_app.py [file.fits] [-e EXPOSURE_MS] [-g GAIN]
 
@@ -30,6 +33,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Circle
 
 from spot import measure_spot
+from stage_panel import StagePanel
 
 STRETCHES = {
     "min / max": (0.0, 100.0),
@@ -54,8 +58,8 @@ class CameraWorker:
         self._mode = None
         threading.Thread(target=self._run, daemon=True).start()
 
-    def capture(self, mode, exposure_ms, gain, imagetyp, path):
-        self._jobs.put(("capture", (mode, exposure_ms, gain, imagetyp, path)))
+    def capture(self, mode, exposure_ms, gain, imagetyp, path, extra=None):
+        self._jobs.put(("capture", (mode, exposure_ms, gain, imagetyp, path, extra)))
 
     def shutdown(self):
         self._jobs.put(("close", None))
@@ -73,7 +77,7 @@ class CameraWorker:
                 self._close()
                 self.results.put(("error", f"{type(exc).__name__}: {exc}"))
 
-    def _capture(self, mode, exposure_ms, gain, imagetyp, path):
+    def _capture(self, mode, exposure_ms, gain, imagetyp, path, extra):
         from ueye_cam import UEyeCamera  # imported here so viewing works without pyueye
 
         if self._cam is None or mode != self._mode:
@@ -94,7 +98,7 @@ class CameraWorker:
         self.results.put(("status", f"exposing {self._cam.exposure_ms:.3f} ms..."))
         frame = self._cam.snap()
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        frame.save_fits(path, imagetyp=imagetyp)
+        frame.save_fits(path, imagetyp=imagetyp, extra=extra)
         return path, notes
 
     def _close(self):
@@ -109,7 +113,7 @@ class CaptureApp:
     def __init__(self, root: tk.Tk, initial_file: str = None, exposure_ms: float = 1.0, gain: int = 0):
         self.root = root
         self.root.title("uEye Capture")
-        self.root.geometry("1300x880")
+        self.root.geometry("1350x900")
         self.worker = CameraWorker()
 
         self.data = None        # 2D or 3D array of the open FITS
@@ -242,6 +246,9 @@ class CaptureApp:
         self.spot_canvas = FigureCanvasTkAgg(self.spot_fig, master=spot_tab)
         self.spot_canvas.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
+        self.stage_panel = StagePanel(tabs, self)
+        tabs.add(self.stage_panel, text="Stage")
+
         header_tab = ttk.Frame(tabs)
         tabs.add(header_tab, text="Header")
         self.header_text = tk.Text(header_tab, font=("Consolas", 10), wrap=tk.NONE)
@@ -250,22 +257,40 @@ class CaptureApp:
     # -- actions -------------------------------------------------------------
 
     def capture(self):
-        if str(self.capture_btn["state"]) == tk.DISABLED:
+        if self.stage_panel.running:
             return
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.request_capture(os.path.join(self.out_dir.get(), f"{self.prefix.get() or 'frame'}_{stamp}.fits"))
+
+    def request_capture(self, path, extra=None) -> bool:
+        """Start a capture to `path` with the panel's settings. Returns False if
+        the camera is already busy or the settings are invalid."""
+        if str(self.capture_btn["state"]) == tk.DISABLED:
+            return False
         try:
             exposure = float(self.exposure.get())
             gain = int(self.gain.get())
         except (tk.TclError, ValueError):
             messagebox.showerror("Invalid setting", "Exposure and gain must be numbers.")
-            return
+            return False
         if exposure <= 0 or not 0 <= gain <= 100:
             messagebox.showerror("Invalid setting", "Exposure must be > 0 and gain 0-100.")
-            return
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(self.out_dir.get(), f"{self.prefix.get() or 'frame'}_{stamp}.fits")
+            return False
         self.capture_btn.state(["disabled"])
         self.status.set("capturing...")
-        self.worker.capture(self.mode.get(), exposure, gain, self.imagetyp.get().strip().upper(), path)
+        self.worker.capture(self.mode.get(), exposure, gain, self.imagetyp.get().strip().upper(), path, extra)
+        return True
+
+    def run_settings(self) -> dict:
+        """Camera and aperture settings, for stage run reports."""
+        def get(var):
+            try:
+                return var.get()
+            except tk.TclError:
+                return None
+        return dict(exposure_ms=get(self.exposure), gain=get(self.gain), mode=self.mode.get(),
+                    r_ap=get(self.r_ap), r_in=get(self.r_in), r_out=get(self.r_out),
+                    pixel_um=self.header.get("XPIXSZ") if self.header is not None else None)
 
     def clear_captures(self):
         """Delete this app's captures (<prefix>_YYYYmmdd_HHMMSS.fits) from the
@@ -297,13 +322,17 @@ class CaptureApp:
                 hdu = next((h for h in hdul if h.data is not None and h.data.ndim >= 2), None)
                 if hdu is None:
                     raise ValueError("no image data in file")
-                self.data = np.asarray(hdu.data)
-                if self.data.ndim > 3:  # flatten extra axes into one frame axis
-                    self.data = self.data.reshape(-1, *self.data.shape[-2:])
-                self.header = hdu.header.copy()
+                data = np.asarray(hdu.data)
+                if data.ndim > 3:  # flatten extra axes into one frame axis
+                    data = data.reshape(-1, *data.shape[-2:])
+                header = hdu.header.copy()
         except Exception as exc:
             messagebox.showerror("Can't open FITS", f"{path}\n\n{exc}")
             return
+        # Same frame size as what's on screen (e.g. a new exposure): keep the
+        # current zoom/pan instead of jumping back to the full frame.
+        keep_view = self.data is not None and self.data.shape[-2:] == data.shape[-2:]
+        self.data, self.header = data, header
         self.path = path
         n = self.data.shape[0] if self.data.ndim == 3 else 1
         self.frame_idx.set(0)
@@ -311,7 +340,7 @@ class CaptureApp:
         self.header_text.delete("1.0", tk.END)
         self.header_text.insert(tk.END, self.header.tostring(sep="\n").rstrip())
         self.root.title(f"uEye Capture - {os.path.basename(path)}")
-        self.redraw(reset_view=True)
+        self.redraw(reset_view=not keep_view)
 
     def redraw(self, reset_view=False):
         if self.data is None:
@@ -504,10 +533,14 @@ class CaptureApp:
                     self.capture_btn.state(["!disabled"])
                     self.status.set(f"saved {path}" + "".join(f"\n{n}" for n in notes))
                     self.load_fits(path)
+                    self.stage_panel.on_captured(path)
                 elif kind == "error":
                     self.capture_btn.state(["!disabled"])
                     self.status.set("capture failed")
-                    messagebox.showerror("Capture failed", payload)
+                    was_running = self.stage_panel.running
+                    self.stage_panel.on_capture_failed(payload)  # aborts a run and reports it itself
+                    if not was_running:
+                        messagebox.showerror("Capture failed", payload)
                 elif kind == "closed":
                     self.root.destroy()
                     return
@@ -517,6 +550,7 @@ class CaptureApp:
 
     def _on_quit(self):
         self.status.set("closing camera...")
+        self.stage_panel.shutdown()
         self.worker.shutdown()
         self.root.after(3000, self.root.destroy)  # don't hang if the driver does
 
